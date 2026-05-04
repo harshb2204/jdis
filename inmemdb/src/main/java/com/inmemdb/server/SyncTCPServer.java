@@ -35,6 +35,14 @@ public class SyncTCPServer {
     }
 
     // Main server loop — accepts connections sequentially and echoes commands
+    /*
+    ServerSocket — the listening socket. It binds to a port and waits for clients. 
+    Socket — a client connection. Once a client connects, 
+    you get a Socket object representing that specific conversation.
+    Binds to port 7379 on 0.0.0.0 (all network interfaces)
+    50 is the backlog — how many clients the OS will queue up while your code is busy. 
+    That's why Client 2 appeared "connected" even though our code hadn't called accept() yet — the OS held it in this queue.
+    */
     public static void run() throws IOException {
         ServerSocket serverSocket = new ServerSocket(Config.PORT,
                 50,
