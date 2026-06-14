@@ -113,4 +113,22 @@ public class RESPDecoder {
             throw new IllegalArgumentException("no data");
         return decodeOne(data).value();
     }
+
+    /**
+     * Decodes RESP-encoded data (expected to be an array of bulk strings)
+     * into a String array. This is used for parsing client commands.
+     * Equivalent to DecodeArrayString in resp.go.
+     */
+    public static String[] decodeArrayString(byte[] data) {
+        Object value = decode(data);
+        if (!(value instanceof List)) {
+            throw new IllegalArgumentException("expected array, got: " + value);
+        }
+        List<?> list = (List<?>) value;
+        String[] tokens = new String[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            tokens[i] = list.get(i).toString();
+        }
+        return tokens;
+    }
 }
