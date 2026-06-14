@@ -64,7 +64,7 @@ ACQ LOCK
 ——— REL LOCK
 
 # I/O Multiplexing (Apparent Concurrency)
-* This is how event loops are implemented.
+This is how event loops are implemented.
 
 IO system calls are blocking.
 e.g.: reading from a socket
