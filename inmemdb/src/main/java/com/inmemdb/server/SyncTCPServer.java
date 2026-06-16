@@ -1,47 +1,45 @@
 package com.inmemdb.server;
 
 import com.inmemdb.config.Config;
-import com.inmemdb.core.Eval;
 import com.inmemdb.core.RESPDecoder;
+import com.inmemdb.core.RESPEncoder;
 import com.inmemdb.core.RedisCmd;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.util.Arrays;
 
+/**
+ * Synchronous (single-client-at-a-time) TCP server.
+ * Kept for reference and comparison with the async NIO and Netty servers.
+ */
 public class SyncTCPServer {
 
     private static final int BUFFER_SIZE = 512;
 
     /**
-     * Reads raw bytes from the client, decodes the RESP array into tokens,
+     * Reads raw bytes from the client channel, decodes the RESP payload into tokens,
      * and constructs a RedisCmd object.
-     * Equivalent to readCommand in sync_tcp.go.
      */
-    private static RedisCmd readCommand(Socket client) throws IOException {
-        // TODO: Max read in one shot is 512 bytes
-        // To allow input > 512 bytes, then repeated read until
-        // we get EOF or designated delimiter
-        InputStream in = client.getInputStream();
-        byte[] buffer = new byte[BUFFER_SIZE];
-        int bytesRead = in.read(buffer);
+    private static RedisCmd readCommand(SocketChannel channel) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
+        int bytesRead = channel.read(buffer);
+
         if (bytesRead == -1) {
-            return null;
+            return null; // client closed connection
         }
 
-        byte[] data = Arrays.copyOf(buffer, bytesRead);
+        byte[] data = Arrays.copyOf(buffer.array(), bytesRead);
 
         String[] tokens;
 
-        // Check if the data is RESP-encoded (starts with '*' for arrays)
-        // If not, treat it as an inline command (plain text from telnet)
+        // RESP array starts with '*'; otherwise treat as inline (telnet) command
         if (data.length > 0 && data[0] == '*') {
             tokens = RESPDecoder.decodeArrayString(data);
         } else {
-            // Inline command: split by whitespace
             String inline = new String(data).trim();
             tokens = inline.split("\\s+");
         }
@@ -58,27 +56,41 @@ public class SyncTCPServer {
     /**
      * Sends a RESP-formatted error response to the client.
      */
-    private static void respondError(Exception err, Socket client) throws IOException {
-        OutputStream out = client.getOutputStream();
-        out.write(String.format("-%s\r\n", err.getMessage()).getBytes());
-        out.flush();
+    private static void respondError(String message, SocketChannel channel) throws IOException {
+        channel.write(ByteBuffer.wrap(("-" + message + "\r\n").getBytes()));
     }
 
     /**
      * Evaluates the command and sends the response to the client.
-     * If evaluation throws an error, sends a RESP error response.
-     * Equivalent to respond in sync_tcp.go.
      */
-    private static void respond(RedisCmd cmd, Socket client) {
+    private static void respond(RedisCmd cmd, SocketChannel channel) {
+        System.out.println("command: " + cmd.getCmd());
         try {
-            Eval.evalAndRespond(cmd, client);
+            switch (cmd.getCmd()) {
+                case "PING":
+                    evalPING(cmd.getArgs(), channel);
+                    break;
+                default:
+                    evalPING(cmd.getArgs(), channel);
+                    break;
+            }
         } catch (IOException e) {
             try {
-                respondError(e, client);
+                respondError(e.getMessage(), channel);
             } catch (IOException writeErr) {
                 System.err.println("error writing error response: " + writeErr.getMessage());
             }
         }
+    }
+
+    private static void evalPING(String[] args, SocketChannel channel) throws IOException {
+        if (args.length >= 2) {
+            throw new IOException("ERR wrong number of arguments for 'ping' command");
+        }
+        byte[] response = args.length == 0
+                ? RESPEncoder.encode("PONG", true)
+                : RESPEncoder.encode(args[0], false);
+        channel.write(ByteBuffer.wrap(response));
     }
 
     /**
@@ -86,18 +98,17 @@ public class SyncTCPServer {
      * evaluates them, and sends responses.
      */
     public static void run() throws IOException {
-        ServerSocket serverSocket = new ServerSocket(Config.PORT,
-                50,
-                java.net.InetAddress.getByName(Config.HOST));
+        ServerSocketChannel serverChannel = ServerSocketChannel.open();
+        serverChannel.bind(new InetSocketAddress(Config.HOST, Config.PORT));
 
         System.out.println("ready to accept connections on " + Config.HOST + ":" + Config.PORT);
 
         int clientCount = 0;
 
         while (true) {
-            Socket client = serverSocket.accept();
+            SocketChannel client = serverChannel.accept();
             clientCount++;
-            System.out.println("client connected with address: " + client.getRemoteSocketAddress()
+            System.out.println("client connected with address: " + client.getRemoteAddress()
                     + ", client count: " + clientCount);
 
             while (true) {
@@ -111,7 +122,7 @@ public class SyncTCPServer {
 
                 if (cmd == null) {
                     clientCount--;
-                    System.out.println("client disconnected: " + client.getRemoteSocketAddress()
+                    System.out.println("client disconnected: " + client.getRemoteAddress()
                             + ", client count: " + clientCount);
                     client.close();
                     break;
