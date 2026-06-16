@@ -1,7 +1,7 @@
 package com.inmemdb;
 
 import com.inmemdb.config.Config;
-import com.inmemdb.server.SyncTCPServer;
+import com.inmemdb.server.NettyTCPServer;
 
 public class Main {
 
@@ -20,12 +20,12 @@ public class Main {
     }
 
     // java -jar bin/inmemdb.jar
+    // redis-cli -p 7379
     // telnet localhost 7379
-
 
     public static void main(String[] args) throws Exception {
         setupFlags(args);
         System.out.println("starting a simple redis-compatible server");
-        SyncTCPServer.run();
+        NettyTCPServer.run();
     }
 }
