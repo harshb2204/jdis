@@ -11,13 +11,11 @@ public class RESPDecoder {
     // value -> parsed result
     // delta -> bytes consumed
 
-    // reads a length integer from data until a non-digit byte, returns [length,
-    // delta]
+    // reads a length integer from data until a non-digit byte, returns [length, delta]
     /*
      * $5\r\nhello\r\n
      * ^
      * this part → "5\r\n"
-     * 
      */
     private static int[] readLength(byte[] data) {
         int pos = 0, length = 0;
@@ -116,8 +114,7 @@ public class RESPDecoder {
 
     /**
      * Decodes RESP-encoded data (expected to be an array of bulk strings)
-     * into a String array. This is used for parsing client commands.
-     * Equivalent to DecodeArrayString in resp.go.
+     * into a String array. Used for parsing client commands.
      */
     public static String[] decodeArrayString(byte[] data) {
         Object value = decode(data);
