@@ -10,12 +10,24 @@ Building a simplified Redis from scratch in Java to understand its internals —
 
 This project is a ground-up implementation of a Redis-compatible in-memory database server in Java. The goal is to understand how Redis works internally — starting from raw TCP socket handling, the RESP wire protocol, and building up toward a full key-value store.
 
-The current implementation (`inmemdb/`) is **Phase 1**: a synchronous, single-threaded TCP server that:
+The current implementation (`inmemdb/`) is **Phase 3**: a high-performance, fully concurrent TCP server built on **Netty** with native **epoll** (Linux/WSL) that:
 - Listens on a configurable host/port (default `0.0.0.0:7379`)
-- Accepts client connections one at a time (blocking I/O)
-- Reads raw bytes from the client
-- Echoes the command back to the client
-- Includes a RESP protocol decoder (ready for command parsing)
+- Accepts and handles **thousands of concurrent clients** in a single thread using epoll I/O multiplexing
+- Uses Netty's **native epoll transport** on Linux/WSL (edge-triggered, zero-copy, pooled off-heap buffers)
+- Parses incoming data as RESP protocol (from `redis-cli`) or inline commands (from `telnet`)
+- Handles TCP fragmentation automatically — partial reads are buffered and retried
+- Evaluates commands and responds with proper RESP-encoded responses
+- Supports `PING`, `SET` (with optional `EX` expiry), `GET`, and `TTL` with full Redis-compatible behavior
+- Includes a RESP protocol decoder and encoder
+- Maintains an in-memory key-value store with optional per-key TTL (time-to-live)
+
+### Evolution of the server
+
+| Phase | Server | Concurrency model |
+|-------|--------|-------------------|
+| 1 | `SyncTCPServer` | Single client at a time (blocking I/O) |
+| 2 | `AsyncTCPServer` | Many clients, NIO `Selector` (level-triggered epoll) |
+| 3 | `NettyTCPServer` ← **current** | Many clients, **1 thread**, Netty native epoll (edge-triggered, pooled buffers) — same model as Redis |
 
 ---
 
@@ -23,20 +35,30 @@ The current implementation (`inmemdb/`) is **Phase 1**: a synchronous, single-th
 
 ```
 inmemdb/
-├── pom.xml                          # Maven build file
+├── pom.xml                          # Maven build file (includes Netty dependencies)
 ├── bin/
-│   └── inmemdb.jar                  # Pre-built executable JAR
+│   ├── inmemdb.jar                  # Pre-built executable JAR
+│   └── libs/                        # Netty and dependency JARs (auto-copied by Maven)
 └── src/
     └── main/
         └── java/
             └── com/inmemdb/
-                ├── Main.java                    # Entry point — parses CLI args, starts server
+                ├── Main.java                        # Entry point — parses CLI args, starts server
                 ├── config/
-                │   └── Config.java              # Global config (HOST, PORT)
+                │   └── Config.java                  # Global config (HOST, PORT)
                 ├── core/
-                │   └── RESPDecoder.java         # RESP protocol parser
+                │   ├── Store.java                    # In-memory key-value store (Obj, put, get)
+                │   ├── RESPDecoder.java              # RESP protocol parser (decode)
+                │   ├── RESPEncoder.java              # RESP protocol encoder (encode responses)
+                │   ├── RedisCmd.java                 # Command object (cmd + args)
+                │   └── Eval.java                    # Command evaluator — PING, SET, GET, TTL
                 └── server/
-                    └── SyncTCPServer.java       # Synchronous TCP server
+                    ├── NettyTCPServer.java           # ← Active server: Netty + native epoll
+                    ├── AsyncTCPServer.java           # Reference: NIO Selector (level-triggered epoll)
+                    ├── SyncTCPServer.java            # Reference: single-client blocking server
+                    └── handler/
+                        ├── RESPCommandDecoder.java   # Netty pipeline stage 1: ByteBuf → RedisCmd
+                        └── CommandHandler.java       # Netty pipeline stage 2: RedisCmd → response
 ```
 
 ---
@@ -50,31 +72,25 @@ inmemdb/
 
 ---
 
-### Option 1 — Run the pre-built JAR directly
-
-A pre-built JAR is already included in `inmemdb/bin/`:
-
-```bash
-# Run with default host (0.0.0.0) and port (7379)
-java -jar inmemdb/bin/inmemdb.jar
-
-# Run with custom host and port
-java -jar inmemdb/bin/inmemdb.jar --host 127.0.0.1 --port 6379
-```
-
----
-
-### Option 2 — Build from source and run
+### Option 1 — Build from source and run
 
 ```bash
 # Navigate to the inmemdb directory
 cd inmemdb
 
-# Build the project (compiles and packages into bin/inmemdb.jar)
+# Build the project (compiles, packages JAR, copies Netty libs to bin/libs/)
 mvn package
 
 # Run the JAR
 java -jar bin/inmemdb.jar
+```
+
+---
+
+### Option 2 — Run with custom host/port
+
+```bash
+java -jar bin/inmemdb.jar --host 127.0.0.1 --port 6379
 ```
 
 ---
@@ -105,16 +121,153 @@ telnet 172.17.32.1 7379
 redis-cli -h 172.17.32.1 -p 7379
 ```
 
+**Running directly in WSL (recommended for native epoll):**
 
+```bash
+# Build and run inside WSL — this activates Netty's native epoll transport
+cd inmemdb && mvn package -q && java -jar bin/inmemdb.jar
+```
 
 You should see output like:
 ```
 starting a simple redis-compatible server
+starting Netty TCP server on 0.0.0.0:7379 [transport: native epoll]
 ready to accept connections on 0.0.0.0:7379
-client connected with address: /172.17.x.x:XXXXX, client count: 1
 ```
 
-Type anything in the telnet session and the server will echo it back.
+> When running on Windows (not WSL), the transport line will say `[transport: NIO]` — Netty automatically falls back to Java NIO since native epoll is Linux-only.
+
+---
+
+### Try the PING command
+
+**Using `redis-cli`** (human-friendly output):
+```
+127.0.0.1:7379> PING
+PONG
+127.0.0.1:7379> PING hello
+"hello"
+127.0.0.1:7379> PING hello world
+(error) ERR wrong number of arguments for 'ping' command
+```
+
+**Using `telnet`** (raw RESP output):
+```
+PING
++PONG
+PING hello
+$5
+hello
+PING hello world
+-ERR wrong number of arguments for 'ping' command
+```
+
+The difference is that `redis-cli` parses the RESP response and displays it in a user-friendly format, while `telnet` shows the raw RESP wire format:
+- `+PONG` → RESP Simple String (prefix `+`)
+- `$5\r\nhello` → RESP Bulk String (prefix `$`, length 5, then the data)
+- `-ERR ...` → RESP Error (prefix `-`)
+
+---
+
+### Try SET, GET, and TTL
+
+**Using `redis-cli`** (human-friendly output):
+```
+# Basic SET and GET
+127.0.0.1:7379> SET city tokyo
+OK
+127.0.0.1:7379> GET city
+"tokyo"
+
+# GET a key that doesn't exist → nil
+127.0.0.1:7379> GET unknown
+(nil)
+
+# SET with EX (expiry in seconds)
+127.0.0.1:7379> SET session abc123 EX 10
+OK
+127.0.0.1:7379> TTL session
+(integer) 9
+
+# TTL on a key with no expiry → -1
+127.0.0.1:7379> TTL name
+(integer) -1
+
+# TTL on a key that doesn't exist → -2
+127.0.0.1:7379> TTL ghost
+(integer) -2
+
+# After the key expires, GET returns nil and TTL returns -2
+127.0.0.1:7379> GET session
+(nil)
+127.0.0.1:7379> TTL session
+(integer) -2
+
+# Wrong number of arguments
+127.0.0.1:7379> SET
+(error) ERR wrong number of arguments for 'set' command
+127.0.0.1:7379> GET
+(error) ERR wrong number of arguments for 'get' command
+127.0.0.1:7379> SET key value BADOPT
+(error) ERR syntax error
+```
+
+**Using `telnet`** (raw RESP output):
+```
+SET city tokyo
++OK
+GET city
+$5
+tokyo
+GET unknown
+$-1
+SET session abc123 EX 10
++OK
+TTL session
+:9
+TTL name
+:-1
+TTL ghost
+:-2
+```
+
+The RESP types used in responses:
+- `+OK` → RESP Simple String — SET always responds with this on success
+- `$N\r\n<value>` → RESP Bulk String — GET returns the stored value
+- `$-1` → RESP Nil Bulk String — GET returns this when the key doesn't exist or has expired
+- `:N` → RESP Integer — TTL returns the remaining seconds (or -1 / -2 sentinel values)
+- `-ERR ...` → RESP Error — returned on bad arguments or syntax errors
+
+---
+
+### Benchmarking
+
+Use `redis-benchmark` to compare performance between real Redis and our server.
+
+**Benchmark real Redis (baseline):**
+```bash
+redis-benchmark -n 100000 -t ping_inline -c 50 -P 1 -h localhost -p 6379
+redis-benchmark -n 100000 -t ping_mbulk -c 50 -P 1 -h localhost -p 6379
+```
+
+**Benchmark our server (from WSL):**
+```bash
+redis-benchmark -n 100000 -t ping_inline -c 50 -P 1 -h 172.17.32.1 -p 7379
+redis-benchmark -n 100000 -t ping_mbulk -c 50 -P 1 -h 172.17.32.1 -p 7379
+```
+
+**Flags explained:**
+| Flag | Meaning |
+|------|---------|
+| `-n 100000` | Total number of requests to send |
+| `-t ping_inline` | Test inline PING (plain text, like telnet) |
+| `-t ping_mbulk` | Test PING via RESP protocol (bulk string) |
+| `-c 50` | Use 50 concurrent clients — the server now handles this |
+| `-P 1` | Disable pipelining (send 1 command, wait for response) |
+| `-h` | Host address |
+| `-p` | Port number |
+
+> **Note:** Unlike Phase 1, you can now use `-c 50` (or higher) because the Netty server handles all clients concurrently in a single event loop thread.
 
 ---
 
@@ -137,7 +290,7 @@ public class Main {
     public static void main(String[] args) throws Exception {
         setupFlags(args);
         System.out.println("starting a simple redis-compatible server");
-        SyncTCPServer.run();
+        NettyTCPServer.run();
     }
 }
 ```
@@ -145,7 +298,7 @@ public class Main {
 **What it does:**
 
 - `setupFlags()` iterates over the command-line arguments looking for `--host` and `--port` flags. If found, it overwrites the defaults in `Config`. This is a simple hand-rolled argument parser — no external library needed.
-- `main()` calls `setupFlags()` first, then hands off control to `SyncTCPServer.run()` which never returns (it's an infinite loop).
+- `main()` calls `setupFlags()` first, then hands off control to `NettyTCPServer.run()` which blocks until the server is shut down.
 - The `throws Exception` on `main` is intentional — if the server socket fails to bind (e.g., port already in use), the exception propagates and the JVM prints the error and exits.
 
 ---
@@ -168,114 +321,471 @@ public class Config {
 
 ---
 
-### `SyncTCPServer.java` — The TCP Server
+### `NettyTCPServer.java` — The Netty Server
 
-This is the heart of the server. It implements a classic **synchronous, single-threaded** TCP server loop.
+This is the heart of Phase 3. It sets up a Netty `ServerBootstrap` with a **single event loop thread** — exactly like Redis — and a pipeline of handlers per connection.
 
 ```java
-public static void run() throws IOException {
-    ServerSocket serverSocket = new ServerSocket(Config.PORT, 50,
-            java.net.InetAddress.getByName(Config.HOST));
+public static void run() throws InterruptedException {
+    boolean useEpoll = Epoll.isAvailable();
 
-    System.out.println("ready to accept connections on " + Config.HOST + ":" + Config.PORT);
+    // One thread handles everything: accept + all I/O — same as Redis
+    EventLoopGroup group = useEpoll
+            ? new EpollEventLoopGroup(1)
+            : new NioEventLoopGroup(1);
 
-    int clientCount = 0;
-
-    while (true) {
-        Socket client = serverSocket.accept();   // BLOCKS here until a client connects
-        clientCount++;
-        System.out.println("client connected: " + client.getRemoteSocketAddress()
-                + ", client count: " + clientCount);
-
-        while (true) {
-            String command = readCommand(client); // BLOCKS here until data arrives
-            if (command == null) {
-                clientCount--;
-                System.out.println("client disconnected: " + client.getRemoteSocketAddress()
-                        + ", client count: " + clientCount);
-                client.close();
-                break;
+    ServerBootstrap bootstrap = new ServerBootstrap();
+    bootstrap
+        .group(group)   // single group, single thread
+        .channel(useEpoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class)
+        .childHandler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                ch.pipeline().addLast("decoder", new RESPCommandDecoder());
+                ch.pipeline().addLast("handler", new CommandHandler());
             }
-            respond(command, client);
-        }
-    }
+        })
+        .option(ChannelOption.SO_BACKLOG, 20000)
+        .childOption(ChannelOption.TCP_NODELAY, true);
+
+    bootstrap.bind(Config.HOST, Config.PORT).sync()
+             .channel().closeFuture().sync();
 }
 ```
 
 **Breaking it down piece by piece:**
 
-#### `ServerSocket` — The Listening Socket
+#### `Epoll.isAvailable()` — Transport Detection
 
 ```java
-ServerSocket serverSocket = new ServerSocket(Config.PORT, 50,
-        java.net.InetAddress.getByName(Config.HOST));
+boolean useEpoll = Epoll.isAvailable();
 ```
 
-- `ServerSocket` is Java's abstraction over a TCP listening socket. It binds to a port and waits for incoming client connections.
-- The **three arguments** are:
-  1. `Config.PORT` — the port to bind to (`7379` by default).
-  2. `50` — the **backlog**. This is the OS-level queue size for incoming connections that haven't been `accept()`-ed yet. If your code is busy processing a client and a second client connects, the OS holds it in this queue (up to 50 clients). This is why a second `telnet` session appears "connected" even before your code calls `accept()` — the OS accepted it at the kernel level.
-  3. `InetAddress.getByName(Config.HOST)` — the network interface to bind to. `"0.0.0.0"` means all interfaces.
+- Checks at runtime whether the native epoll `.so` library is available (Linux/WSL only).
+- If `true`: uses `EpollEventLoopGroup` + `EpollServerSocketChannel` — native epoll, edge-triggered, zero-copy.
+- If `false`: falls back to `NioEventLoopGroup` + `NioServerSocketChannel` — Java NIO Selector, works on all platforms.
+- This makes the same JAR work on both Windows (NIO) and Linux/WSL (native epoll) without any code changes.
 
-#### The Outer Loop — Accepting Clients
+#### Single Event Loop Group — 1 Thread for Everything
 
 ```java
-while (true) {
-    Socket client = serverSocket.accept(); // blocking
-    ...
-}
+EventLoopGroup group = new EpollEventLoopGroup(1);  // exactly 1 thread
+bootstrap.group(group);                              // used for both accept and I/O
 ```
 
-- `serverSocket.accept()` is a **blocking call** — the thread sleeps here until a client connects. When one does, it returns a `Socket` object representing that specific client connection.
-- This is a **synchronous** server: it handles one client at a time. While talking to Client 1, Client 2 sits in the OS backlog queue. Client 2 only gets served after Client 1 disconnects.
-- This is the key limitation of this phase — it's the simplest possible design, and the starting point before introducing I/O multiplexing (like `select`/`epoll` in C, or Java NIO's `Selector`).
+- A single `EventLoopGroup` with **1 thread** is passed as both the boss and worker group.
+- This one thread does everything Redis's main thread does:
+  - Calls `epoll_wait()` in a loop
+  - When the server socket is ready → accepts the new client and registers it with epoll
+  - When a client socket is ready → reads bytes, runs them through the pipeline, writes the response
+- There is **no context switching, no synchronization, no locks** — because only one thread ever touches the data.
+- On Linux, this thread calls `epoll_wait()` directly via the native JNI `.so` — the same syscall Redis uses.
 
-#### The Inner Loop — Reading Commands
+#### `SO_BACKLOG` and `TCP_NODELAY`
 
 ```java
-while (true) {
-    String command = readCommand(client);
-    if (command == null) { // client disconnected
-        client.close();
-        break;
+.option(ChannelOption.SO_BACKLOG, 20000)       // server socket option
+.childOption(ChannelOption.TCP_NODELAY, true)  // per-client socket option
+```
+
+- `SO_BACKLOG = 20000`: The OS-level queue for incoming connections not yet `accept()`-ed. Set high to handle connection bursts.
+- `TCP_NODELAY = true`: Disables Nagle's algorithm. Nagle buffers small writes and batches them to reduce packet count — useful for bulk transfers but adds latency for request/response protocols like Redis. Disabling it ensures each response is sent immediately.
+
+#### The Pipeline
+
+```java
+ch.pipeline().addLast("decoder", new RESPCommandDecoder());
+ch.pipeline().addLast("handler", new CommandHandler());
+```
+
+- Every accepted client connection gets its own **pipeline** — a chain of handlers that process inbound and outbound data in order.
+- **Inbound** (client → server): bytes flow through `RESPCommandDecoder` first, then `CommandHandler`.
+- **Outbound** (server → client): responses written in `CommandHandler` flow directly out to the network.
+- A new `RESPCommandDecoder` instance is created per connection (it's stateful — it holds a partial-read buffer). `CommandHandler` is stateless and shared.
+
+---
+
+### `RESPCommandDecoder.java` — Netty Pipeline Stage 1
+
+Converts raw bytes arriving from the network into `RedisCmd` objects.
+
+```java
+public class RESPCommandDecoder extends ByteToMessageDecoder {
+
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        if (in.readableBytes() < 1) return;
+        byte firstByte = in.getByte(in.readerIndex());
+        if (firstByte == '*') {
+            decodeRESPArray(in, out);
+        } else {
+            decodeInline(in, out);
+        }
     }
-    respond(command, client);
 }
 ```
 
-- Once a client is connected, the inner loop keeps reading commands from it until the client disconnects.
-- `readCommand()` returns `null` when the client closes the connection (the stream returns `-1` bytes read).
-- On disconnect, the client socket is closed and the outer loop resumes, waiting for the next client.
+**Why `ByteToMessageDecoder`?**
 
-#### `readCommand()` — Reading Raw Bytes
+TCP is a stream protocol — there is no concept of "message boundaries". A single `redis-cli PING` command might arrive as:
+- One read: `*1\r\n$4\r\nPING\r\n` (complete)
+- Two reads: `*1\r\n$4\r\n` then `PING\r\n` (fragmented)
+- Or even split across three or more reads
+
+`ByteToMessageDecoder` solves this automatically. It maintains a **cumulation buffer** per connection. Every time data arrives, Netty appends it to this buffer and calls `decode()`. If `decode()` doesn't consume all the bytes (because a full command hasn't arrived yet), the remaining bytes stay in the buffer and `decode()` is called again when more data arrives.
+
+**RESP array decoding:**
 
 ```java
-private static String readCommand(Socket client) throws IOException {
-    InputStream in = client.getInputStream();
-    byte[] buffer = new byte[BUFFER_SIZE]; // 512 bytes
-    int bytesRead = in.read(buffer);       // blocking
-    if (bytesRead == -1) return null;      // client disconnected
-    return new String(buffer, 0, bytesRead).trim();
+private void decodeRESPArray(ByteBuf in, List<Object> out) {
+    in.markReaderIndex();  // save position — reset here if we don't have a full frame
+
+    in.readByte();         // consume '*'
+    int count = readInteger(in);  // e.g. *2 → count = 2
+    if (count < 0) { in.resetReaderIndex(); return; }  // not enough data yet
+
+    List<String> tokens = new ArrayList<>(count);
+    for (int i = 0; i < count; i++) {
+        in.readByte();             // consume '$'
+        int len = readInteger(in); // e.g. $4 → len = 4
+        if (in.readableBytes() < len + 2) { in.resetReaderIndex(); return; }
+        String token = in.readCharSequence(len, UTF_8).toString();
+        in.skipBytes(2);           // skip \r\n after the bulk string data
+        tokens.add(token);
+    }
+
+    out.add(new RedisCmd(tokens.get(0).toUpperCase(), /* rest as args */));
 }
 ```
 
-- Reads up to **512 bytes** at a time from the client's input stream. This is a fixed-size buffer — a real implementation would handle partial reads and reassemble multi-packet commands.
-- `in.read()` is **blocking** — the thread waits here until data arrives or the connection closes.
-- Returns `null` on disconnect (`bytesRead == -1`), which signals the inner loop to break.
+- `markReaderIndex()` / `resetReaderIndex()`: If at any point there aren't enough bytes to complete the frame, the reader position is reset to the start of the command. Netty will call `decode()` again when more bytes arrive.
+- `readCharSequence(len, UTF_8)`: Reads exactly `len` bytes as a string — safe for binary data and strings containing `\r\n`.
 
-#### `respond()` — Sending a Response
+**Inline decoding (telnet support):**
 
 ```java
-private static void respond(String command, Socket client) throws IOException {
-    OutputStream out = client.getOutputStream();
-    out.write((command + "\n").getBytes());
-    out.flush();
+private void decodeInline(ByteBuf in, List<Object> out) {
+    int lineEnd = findLineEnd(in);
+    if (lineEnd < 0) return;  // no \n found yet — wait for more data
+
+    String line = in.readCharSequence(lineEnd - in.readerIndex(), UTF_8).toString().trim();
+    // skip \r\n, split by whitespace, build RedisCmd
 }
 ```
 
-- Currently just **echoes** the received command back to the client with a newline appended.
-- `out.flush()` ensures the bytes are actually sent over the network immediately, not held in a buffer.
-- This is a placeholder — in future phases this will be replaced with actual command parsing and execution (SET, GET, etc.).
+- Scans for a `\n` byte. If not found, returns without consuming anything — waits for more data.
+- Once a full line is available, splits it by whitespace to get command + args.
+
+**Note on `@Sharable`:**
+
+`ByteToMessageDecoder` holds a per-connection cumulation buffer as instance state, so it **cannot** be marked `@Sharable`. A new `RESPCommandDecoder` instance is created for each connection by the `ChannelInitializer` in `NettyTCPServer`.
+
+---
+
+### `CommandHandler.java` — Netty Pipeline Stage 2
+
+Receives fully-decoded `RedisCmd` objects and dispatches them to `Eval`.
+
+```java
+@ChannelHandler.Sharable
+public class CommandHandler extends SimpleChannelInboundHandler<RedisCmd> {
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, RedisCmd cmd) {
+        System.out.println("command: " + cmd.getCmd());
+        Eval.evalAndRespond(cmd, ctx);
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+        System.out.println("client connected: " + ctx.channel().remoteAddress());
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) {
+        System.out.println("client disconnected: " + ctx.channel().remoteAddress());
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        System.err.println("error on channel " + ctx.channel().remoteAddress()
+                + ": " + cause.getMessage());
+        ctx.close();
+    }
+}
+```
+
+**What it does:**
+
+- `SimpleChannelInboundHandler<RedisCmd>`: A Netty base class that only fires `channelRead0()` when the inbound message is of type `RedisCmd`. It also automatically releases the message's reference count after `channelRead0()` returns (Netty uses reference-counted buffers).
+- `channelRead0()`: The hot path. Called once per fully-decoded command. Delegates to `Eval.evalAndRespond()`.
+- `channelActive()` / `channelInactive()`: Lifecycle hooks — called when a client connects or disconnects. Used for logging.
+- `exceptionCaught()`: Called when an unhandled exception occurs in the pipeline. Logs the error and closes the channel.
+- `@Sharable`: Safe to mark because this handler holds no per-connection state — a single instance is shared across all connections.
+
+---
+
+### `Store.java` — The In-Memory Key-Value Store
+
+The store is the heart of the database — it holds all key-value pairs in a `HashMap` and wraps each value in an `Obj` that carries an optional expiry timestamp.
+
+```java
+public class Store {
+
+    private static final Map<String, Obj> store = new HashMap<>();
+
+    public static class Obj {
+        public final Object value;
+        public final long expiresAt; // -1 = no expiry, else Unix ms timestamp
+    }
+
+    public static Obj newObj(Object value, long durationMs) { ... }
+    public static void put(String key, Obj obj) { ... }
+    public static Obj get(String key) { ... }
+}
+```
+
+#### `Obj` — The Value Wrapper
+
+```java
+public static class Obj {
+    public final Object value;
+    public final long expiresAt; // -1 = no expiry
+}
+```
+
+- Every stored value is wrapped in an `Obj` rather than stored raw. This lets us attach metadata (currently just `expiresAt`) to any value without changing the map's type.
+- `value` is `Object` — the store is type-agnostic. Right now all values are `String`, but future commands (e.g., `LPUSH`, `HSET`) can store lists, maps, etc. without changing the store's API.
+- `expiresAt = -1` means "this key lives forever". Otherwise it is an absolute Unix timestamp in **milliseconds** (not seconds — millisecond precision lets TTL be accurate to within 1ms).
+
+#### `newObj()` — The Factory
+
+```java
+public static Obj newObj(Object value, long durationMs) {
+    long expiresAt = -1;
+    if (durationMs > 0) {
+        expiresAt = System.currentTimeMillis() + durationMs;
+    }
+    return new Obj(value, expiresAt);
+}
+```
+
+- Takes a **duration** (how long from now), not an absolute timestamp. The factory converts it to an absolute timestamp by adding `System.currentTimeMillis()`.
+- `durationMs <= 0` means no expiry — `expiresAt` stays `-1`.
+- Called by `evalSET()` with `durationMs = exDurationSec * 1000` when `EX` is provided, or `durationMs = -1` when no expiry is set.
+
+#### `put()` and `get()`
+
+```java
+public static void put(String key, Obj obj) {
+    store.put(key, obj);
+}
+
+public static Obj get(String key) {
+    return store.get(key);
+}
+```
+
+- `put()` is a direct `HashMap.put()` — no expiry logic here. The `Obj` already has the expiry baked in.
+- `get()` is also a direct `HashMap.get()` — it returns the `Obj` even if it has expired. The **expiry check is done by the caller** (`evalGET` and `evalTTL` in `Eval.java`).
+
+> **Why check expiry in the caller rather than in `get()`?**
+> Different commands need different behaviour on expiry. `GET` returns nil. `TTL` returns `-2`. `PERSIST` would remove the expiry. Keeping `get()` dumb and letting each command decide what to do with an expired key is cleaner and more extensible.
+
+---
+
+### `Eval.java` — The Command Evaluator
+
+Evaluates `RedisCmd` objects and writes RESP responses back through the Netty pipeline.
+
+#### Static Pre-computed Responses
+
+```java
+private static final ByteBuf PONG_RESPONSE = staticBuf("+PONG\r\n");
+private static final ByteBuf OK_RESPONSE   = staticBuf("+OK\r\n");
+private static final ByteBuf NIL_RESPONSE  = staticBuf("$-1\r\n");
+private static final ByteBuf TTL_NO_KEY    = staticBuf(":-2\r\n");
+private static final ByteBuf TTL_NO_EXPIRY = staticBuf(":-1\r\n");
+// ... error strings ...
+
+private static ByteBuf staticBuf(String s) {
+    return Unpooled.unreleasableBuffer(
+            Unpooled.directBuffer().writeBytes(s.getBytes(StandardCharsets.UTF_8)));
+}
+```
+
+Every constant response (OK, NIL, TTL sentinels, all error strings) is pre-allocated once at class load time as an unreleasable off-heap `ByteBuf`. On the hot path, `ctx.writeAndFlush(OK_RESPONSE.duplicate())` sends a view of the same buffer — zero allocation, zero GC. See `docs/L05/README.md` for the full explanation of this pattern.
+
+#### `evalAndRespond()` — The Dispatcher
+
+```java
+public static void evalAndRespond(RedisCmd cmd, ChannelHandlerContext ctx) {
+    switch (cmd.getCmd()) {
+        case "PING": evalPING(cmd.getArgs(), ctx); break;
+        case "SET":  evalSET(cmd.getArgs(), ctx);  break;
+        case "GET":  evalGET(cmd.getArgs(), ctx);  break;
+        case "TTL":  evalTTL(cmd.getArgs(), ctx);  break;
+        default:     evalPING(cmd.getArgs(), ctx); break;
+    }
+}
+```
+
+- Routes each command to its handler by name. `cmd.getCmd()` is always uppercase (normalised in `RESPCommandDecoder`), so the switch cases are simple string literals.
+- Unknown commands fall through to `evalPING`.
+
+#### `evalPING()` — PING
+
+```java
+private static void evalPING(String[] args, ChannelHandlerContext ctx) {
+    if (args.length >= 2) {
+        ctx.writeAndFlush(ERR_PING_ARGS.duplicate());
+        return;
+    }
+    if (args.length == 0) {
+        ctx.writeAndFlush(PONG_RESPONSE.duplicate());
+    } else {
+        // Dynamic bulk string: $<len>\r\n<arg>\r\n
+        byte[] argBytes = args[0].getBytes(StandardCharsets.UTF_8);
+        ByteBuf buf = ctx.alloc().buffer(argBytes.length + 16);
+        buf.writeByte('$');
+        writeAsciiLong(buf, argBytes.length);
+        // ... \r\n + data + \r\n
+        ctx.writeAndFlush(buf);
+    }
+}
+```
+
+- **0 args** → static `+PONG\r\n` — zero allocation.
+- **1 arg** → dynamic bulk string built into a pooled buffer — zero GC.
+- **2+ args** → static error — zero allocation.
+
+#### `evalSET()` — SET key value [EX seconds]
+
+```java
+private static void evalSET(String[] args, ChannelHandlerContext ctx) {
+    if (args.length <= 1) {
+        ctx.writeAndFlush(ERR_SET_ARGS.duplicate());
+        return;
+    }
+
+    String key   = args[0];
+    String value = args[1];
+    long exDurationMs = -1;
+
+    for (int i = 2; i < args.length; i++) {
+        switch (args[i].toUpperCase()) {
+            case "EX":
+                i++;
+                if (i == args.length) { ctx.writeAndFlush(ERR_SYNTAX.duplicate()); return; }
+                try {
+                    exDurationMs = Long.parseLong(args[i]) * 1000;
+                } catch (NumberFormatException e) {
+                    ctx.writeAndFlush(ERR_NOT_INT.duplicate()); return;
+                }
+                break;
+            default:
+                ctx.writeAndFlush(ERR_SYNTAX.duplicate()); return;
+        }
+    }
+
+    Store.put(key, Store.newObj(value, exDurationMs));
+    ctx.writeAndFlush(OK_RESPONSE.duplicate());
+}
+```
+
+- Requires at least 2 args (`key` and `value`). Anything less → error.
+- Iterates over `args[2:]` looking for option flags. Currently only `EX` is supported.
+- `EX` consumes the next token as the expiry in seconds, converts to milliseconds, and passes it to `Store.newObj()`.
+- Any unrecognised option → `-ERR syntax error` (matches Redis behaviour exactly).
+- On success → static `+OK\r\n` — zero allocation.
+
+#### `evalGET()` — GET key
+
+```java
+private static void evalGET(String[] args, ChannelHandlerContext ctx) {
+    if (args.length != 1) { ctx.writeAndFlush(ERR_GET_ARGS.duplicate()); return; }
+
+    Store.Obj obj = Store.get(args[0]);
+
+    if (obj == null) {
+        ctx.writeAndFlush(NIL_RESPONSE.duplicate());  // key doesn't exist
+        return;
+    }
+    if (obj.expiresAt != -1 && obj.expiresAt <= System.currentTimeMillis()) {
+        ctx.writeAndFlush(NIL_RESPONSE.duplicate());  // key has expired
+        return;
+    }
+
+    // Return value as RESP bulk string
+    byte[] valBytes = obj.value.toString().getBytes(StandardCharsets.UTF_8);
+    ByteBuf buf = ctx.alloc().buffer(valBytes.length + 16);
+    buf.writeByte('$');
+    writeAsciiLong(buf, valBytes.length);
+    buf.writeByte('\r'); buf.writeByte('\n');
+    buf.writeBytes(valBytes);
+    buf.writeByte('\r'); buf.writeByte('\n');
+    ctx.writeAndFlush(buf);
+}
+```
+
+- Calls `Store.get()` which returns the raw `Obj` (no expiry check inside the store).
+- Checks expiry inline: if `expiresAt != -1` and the timestamp is in the past → nil.
+- On a live key → writes the value as a RESP Bulk String into a pooled buffer.
+- `$-1\r\n` (nil) is a pre-computed static buffer — zero allocation on the miss path.
+
+#### `evalTTL()` — TTL key
+
+```java
+private static void evalTTL(String[] args, ChannelHandlerContext ctx) {
+    if (args.length != 1) { ctx.writeAndFlush(ERR_TTL_ARGS.duplicate()); return; }
+
+    Store.Obj obj = Store.get(args[0]);
+
+    if (obj == null)           { ctx.writeAndFlush(TTL_NO_KEY.duplicate());    return; } // :-2
+    if (obj.expiresAt == -1)   { ctx.writeAndFlush(TTL_NO_EXPIRY.duplicate()); return; } // :-1
+
+    long durationMs = obj.expiresAt - System.currentTimeMillis();
+    if (durationMs < 0)        { ctx.writeAndFlush(TTL_NO_KEY.duplicate());    return; } // :-2
+
+    // Return remaining seconds as RESP integer
+    long ttlSec = durationMs / 1000;
+    ByteBuf buf = ctx.alloc().buffer(24);
+    buf.writeByte(':');
+    writeAsciiLong(buf, ttlSec);
+    buf.writeByte('\r'); buf.writeByte('\n');
+    ctx.writeAndFlush(buf);
+}
+```
+
+- Three sentinel cases, all served by pre-computed static buffers:
+  - Key doesn't exist → `:-2\r\n`
+  - Key exists, no expiry → `:-1\r\n`
+  - Key exists but already expired → `:-2\r\n`
+- For a live key with an expiry: computes `(expiresAt - now) / 1000` to get remaining seconds, writes it as a RESP Integer into a pooled buffer.
+- Integer division truncates — a key with 9.9 seconds left reports `9`, matching Redis behaviour.
+
+#### `writeAsciiLong()` — Zero-Allocation Integer Serialisation
+
+```java
+private static void writeAsciiLong(ByteBuf buf, long value) {
+    if (value == 0) { buf.writeByte('0'); return; }
+    byte[] digits = new byte[20];
+    int pos = 0;
+    while (value > 0) {
+        digits[pos++] = (byte) ('0' + (value % 10));
+        value /= 10;
+    }
+    for (int i = pos - 1; i >= 0; i--) buf.writeByte(digits[i]);
+}
+```
+
+- Converts a `long` to ASCII digits directly into the `ByteBuf` without calling `Long.toString()` (which allocates a `String`) or `String.getBytes()` (which allocates a `byte[]`).
+- Extracts digits right-to-left using `value % 10`, stores them in a 20-byte stack array, then writes them left-to-right.
+- The `digits[]` array lives on the thread stack — zero heap allocation.
+
+**Why `ChannelHandlerContext` instead of a raw socket?**
+
+In the NIO servers (`SyncTCPServer`, `AsyncTCPServer`), `Eval` wrote directly to a `SocketChannel`. In the Netty server, writing goes through the **pipeline** via `ChannelHandlerContext`. This allows any outbound handlers added to the pipeline (e.g., a future encoder or compressor) to process the response before it hits the wire.
 
 ---
 
@@ -449,15 +959,109 @@ public static Object decode(byte[] data) {
 
 - The public-facing method. Calls `decodeOne()` and unwraps just the `value`, discarding the `delta` (since the caller doesn't need byte-offset tracking at the top level).
 
+#### `decodeArrayString()` — Decoding Commands into String Tokens
+
+```java
+public static String[] decodeArrayString(byte[] data) {
+    Object value = decode(data);
+    List<?> list = (List<?>) value;
+    String[] tokens = new String[list.size()];
+    for (int i = 0; i < list.size(); i++) {
+        tokens[i] = list.get(i).toString();
+    }
+    return tokens;
+}
+```
+
+- A convenience method that decodes RESP data and casts the result into a `String[]`.
+- Used by `AsyncTCPServer` and `SyncTCPServer` to turn the raw RESP array (e.g., `*1\r\n$4\r\nPING\r\n`) into `["PING"]`.
+- In the Netty server, this is handled directly inside `RESPCommandDecoder` using `ByteBuf` instead.
+
+---
+
+### `RESPEncoder.java` — The RESP Protocol Encoder
+
+While `RESPDecoder` handles **incoming** data (client → server), `RESPEncoder` handles **outgoing** responses (server → client).
+
+```java
+public class RESPEncoder {
+
+    public static final byte[] RESP_NIL = "$-1\r\n".getBytes();
+
+    public static byte[] encode(String value, boolean isSimple) {
+        if (isSimple) {
+            return ("+" + value + "\r\n").getBytes();
+        }
+        return ("$" + value.length() + "\r\n" + value + "\r\n").getBytes();
+    }
+
+    public static byte[] encode(long value) {
+        return (":" + value + "\r\n").getBytes();
+    }
+}
+```
+
+**What it does:**
+
+- `encode("PONG", true)` → `+PONG\r\n` (Simple String — used for fixed responses like PONG, OK)
+- `encode("hello", false)` → `$5\r\nhello\r\n` (Bulk String — used for variable-length data)
+- `encode(9L)` → `:9\r\n` (Integer — used for TTL remaining seconds, counts, etc.)
+- `RESP_NIL` → `$-1\r\n` (Nil Bulk String — returned when a key does not exist)
+
+The `isSimple` flag on the string overload determines which RESP type to use:
+- **Simple String** (`+`): No length prefix, terminated by `\r\n`. Cannot contain `\r\n` in the value itself. Used for status replies like `OK` and `PONG`.
+- **Bulk String** (`$`): Has an explicit length prefix, so it can safely contain any bytes including `\r\n`. Used for all variable-length data values.
+- **Integer** (`:`): A signed 64-bit integer. Used for TTL, counts, boolean-style responses (0/1), and any numeric result.
+- **Nil Bulk String** (`$-1`): The special sentinel that means "no value" — returned by `GET` when the key doesn't exist or has expired.
+
+> **Note:** In `Eval.java`, responses are written directly as pre-computed `ByteBuf`s rather than going through `RESPEncoder`. `RESPEncoder` is kept as a utility for the older `SyncTCPServer` and `AsyncTCPServer` code paths that work with raw `byte[]` arrays.
+
+---
+
+### `RedisCmd.java` — The Command Object
+
+```java
+public class RedisCmd {
+    private final String cmd;
+    private final String[] args;
+
+    public RedisCmd(String cmd, String[] args) { ... }
+    public String getCmd() { return cmd; }
+    public String[] getArgs() { return args; }
+}
+```
+
+**What it does:**
+
+- A simple data object that represents a parsed Redis command.
+- `cmd` is always **UPPERCASE** (e.g., `"PING"`, `"GET"`, `"SET"`) — normalized during parsing so the evaluator can use simple string matching.
+- `args` contains everything after the command name. For `PING hello`, `cmd = "PING"` and `args = ["hello"]`.
+
 ---
 
 ## Key Concepts
 
-### Why Synchronous / Single-Threaded?
+### Why Netty?
 
-This is Phase 1 — the simplest possible server. It handles one client at a time. While it's talking to Client 1, Client 2 waits in the OS backlog queue. This is intentional: it establishes the baseline before introducing concurrency or I/O multiplexing.
+Netty is a battle-tested asynchronous networking framework used by gRPC, Cassandra, RocketMQ, and many others. It provides:
 
-Real Redis is also single-threaded for command execution, but uses **I/O multiplexing** (`epoll`/`kqueue`) to handle thousands of concurrent connections without blocking — that's the next phase.
+1. **Native epoll transport** (`netty-transport-native-epoll`): On Linux/WSL, Netty uses a pre-built JNI `.so` that calls `epoll_create1`, `epoll_ctl`, `epoll_wait` directly — the same syscalls Redis uses internally. This gives **edge-triggered epoll** (`EPOLLET`), which is faster than the level-triggered mode used by Java NIO's `Selector`.
+
+2. **Pooled off-heap `ByteBuf` allocator**: Instead of allocating a new `byte[]` or `ByteBuffer` for every read/write (which creates GC pressure), Netty maintains a pool of pre-allocated off-heap memory regions. Buffers are checked out and returned to the pool — zero GC on the hot path.
+
+3. **Automatic TCP fragmentation handling**: `ByteToMessageDecoder` buffers partial reads and retries — you never have to worry about a command arriving in multiple TCP segments.
+
+4. **Pipeline architecture**: Each connection has a chain of handlers. Adding features (compression, TLS, rate limiting) is as simple as adding a new handler to the pipeline.
+
+### Level-Triggered vs Edge-Triggered Epoll
+
+Java NIO's `Selector` uses **level-triggered** epoll: the kernel notifies you repeatedly as long as a file descriptor has data available. If you don't read all the data in one call, you get notified again on the next `select()`.
+
+Netty's native epoll uses **edge-triggered** epoll (`EPOLLET`): the kernel notifies you **only once** when the state changes (e.g., new data arrives). You must read until `EAGAIN` (no more data). This reduces the number of kernel-to-userspace transitions at high connection counts, which is why it's faster.
+
+### Why Single-Threaded?
+
+Real Redis is also single-threaded for command execution. The key insight is that for an in-memory database, the bottleneck is almost never CPU — it's I/O wait. A single thread with epoll can handle tens of thousands of concurrent connections because it never blocks waiting for I/O; it only runs when there's actual work to do.
 
 ### Why Port 7379?
 
@@ -465,35 +1069,37 @@ Redis uses port `6379` by default. This project uses `7379` so you can run both 
 
 ### What is the OS Backlog?
 
-When you create a `ServerSocket` with a backlog of `50`, the OS maintains a queue of up to 50 fully-established TCP connections that your application hasn't called `accept()` on yet. This is why a second `telnet` session appears "connected" immediately even if the server is busy with another client — the OS completed the TCP handshake and queued it.
+When you bind a server socket with `SO_BACKLOG = 20000`, the OS maintains a queue of up to 20,000 fully-established TCP connections that your application hasn't called `accept()` on yet. This handles connection bursts — if 1,000 clients connect simultaneously, the OS queues them and Netty's boss thread drains the queue as fast as it can.
 
 ### Why RESP?
 
-RESP is the protocol Redis clients use to talk to the server. By implementing a RESP decoder, this server can eventually understand real Redis commands sent by any standard Redis client (`redis-cli`, Jedis, Lettuce, etc.) — making it a drop-in compatible server.
+RESP is the protocol Redis clients use to talk to the server. By implementing a RESP decoder, this server can understand real Redis commands sent by any standard Redis client (`redis-cli`, Jedis, Lettuce, etc.) — making it a drop-in compatible server.
 
 ---
 
 ## What Happens When You Connect
 
-Here's the full flow when you run `telnet localhost 7379` and type `hello`:
+Here's the full flow when you run `redis-cli -p 7379` and type `PING`:
 
 ```
-telnet                          SyncTCPServer
+redis-cli                       NettyTCPServer
   |                                  |
   |--- TCP SYN ─────────────────────>|  (OS accepts, queues in backlog)
   |<── TCP SYN-ACK ──────────────────|
   |--- TCP ACK ─────────────────────>|
-  |                                  |  serverSocket.accept() returns Socket
+  |                                  |  Single thread: accept() + register with epoll
   |                                  |  "client connected" printed
   |                                  |
-  |--- "hello\r\n" ─────────────────>|  in.read() unblocks
-  |                                  |  readCommand() returns "hello"
-  |                                  |  respond() called
-  |<── "hello\n" ────────────────────|
+  |--- "*1\r\n$4\r\nPING\r\n" ──────>|  epoll_wait() returns (data ready)
+  |                                  |  Single thread reads bytes into ByteBuf
+  |                                  |  RESPCommandDecoder.decode() → RedisCmd("PING", [])
+  |                                  |  CommandHandler.channelRead0() called
+  |                                  |  Eval.evalAndRespond() → "+PONG\r\n"
+  |                                  |  ctx.writeAndFlush(Unpooled.wrappedBuffer(...))
+  |<── "+PONG\r\n" ──────────────────|
   |                                  |
-  |--- [Ctrl+]] / connection close ─>|  in.read() returns -1
-  |                                  |  readCommand() returns null
-  |                                  |  client.close() called
+  |--- [connection close] ──────────>|  epoll notifies: channel closed
+  |                                  |  CommandHandler.channelInactive() called
   |                                  |  "client disconnected" printed
-  |                                  |  outer loop resumes → serverSocket.accept()
+  |                                  |  Channel deregistered from epoll
 ```
