@@ -1,6 +1,7 @@
 package com.inmemdb.server;
 
 import com.inmemdb.config.Config;
+import com.inmemdb.core.ExpiryManager;
 import com.inmemdb.server.handler.CommandHandler;
 import com.inmemdb.server.handler.RESPCommandDecoder;
 
@@ -14,6 +15,8 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * High-performance async TCP server built on Netty — single-threaded, like Redis.
  *
@@ -23,9 +26,18 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
  *     - Reading data from all connected clients
  *     - Decoding RESP commands
  *     - Evaluating commands and writing responses
+ *     - Running the active-expiry cron (scheduled on the same thread)
  *
- *   This mirrors Redis's architecture: one thread, epoll I/O multiplexing,
- *   never blocking — the thread only runs when there is actual work to do.
+ *   This mirrors Redis's architecture exactly:
+ *     - One thread calls epoll_wait() in a loop
+ *     - Before blocking on epoll_wait(), Redis fires its serverCron() which
+ *       runs the expiry sampling pass
+ *     - In our Netty port, scheduleAtFixedRate() on the EventLoopGroup achieves
+ *       the same effect — the cron task is queued onto the same I/O thread,
+ *       so it runs between epoll_wait() wakeups, never concurrently with a
+ *       command handler
+ *     - Because only one thread ever touches the store, the HashMap needs no
+ *       synchronization — identical to Redis
  *
  * On Linux/WSL, Netty uses its native epoll transport which gives:
  *   - Edge-triggered epoll (EPOLLET) — kernel notifies only on state change
@@ -43,7 +55,6 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 public class NettyTCPServer {
 
     public static void run() throws InterruptedException {
-        // Detect whether native epoll is available (Linux/WSL)
         boolean useEpoll = Epoll.isAvailable();
         System.out.println("starting Netty TCP server on "
                 + Config.HOST + ":" + Config.PORT
@@ -66,6 +77,32 @@ public class NettyTCPServer {
                 : new NioEventLoopGroup(1);
 
         try {
+            /*
+             * Schedule the active-expiry cron on the event loop thread.
+             *
+             * Why scheduleAtFixedRate on the group, not a separate thread:
+             *
+             *   Redis runs its expiry sampling pass inside the same event loop
+             *   iteration, before calling epoll_wait(). This means the cron and
+             *   all command handlers share the same thread — zero concurrency,
+             *   zero locks, zero races on the store.
+             *
+             *   scheduleAtFixedRate() on a Netty EventLoopGroup queues the task
+             *   onto the I/O thread's task queue. Netty drains this queue between
+             *   epoll_wait() wakeups — so the cron fires on the same thread as
+             *   channelRead0(), evalSET(), evalGET(), etc.
+             *
+             *   The store HashMap is therefore only ever touched by one thread,
+             *   making it safe without ConcurrentHashMap or any synchronization.
+             */
+            group.scheduleAtFixedRate(
+                    ExpiryManager::deleteExpiredKeys,
+                    1,          // initial delay — wait 1 s before first run
+                    1,          // period — run every 1 s thereafter
+                    TimeUnit.SECONDS
+            );
+            System.out.println("active expiry cron scheduled on event loop thread (interval: 1s)");
+
             ServerBootstrap bootstrap = new ServerBootstrap();
             bootstrap
                 // Same single-thread group for both accept and I/O
