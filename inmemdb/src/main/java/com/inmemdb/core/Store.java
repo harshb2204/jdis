@@ -9,13 +9,13 @@ import java.util.Map;
  * Each value is wrapped in an {@link Obj} that carries the raw value and an
  * optional expiry timestamp (milliseconds since epoch, or -1 for "no expiry").
  *
- * Get() does NOT do lazy expiry — the TTL check is done by the caller
- * (evalGET() and evalTTL() in Eval.java).
+ * get() performs lazy expiry: if the key has expired it is deleted on access
+ * and null is returned, exactly like Redis does.
  */
 public class Store {
 
-    // The single global store — package-private so Eval can call Put/Get directly.
-    private static final Map<String, Obj> store = new HashMap<>();
+    // The single global store — package-private so ExpiryManager can iterate it.
+    static final Map<String, Obj> store = new HashMap<>();
 
     // -------------------------------------------------------------------------
     // Obj — the value wrapper
@@ -29,7 +29,7 @@ public class Store {
      */
     public static class Obj {
         public final Object value;
-        public final long expiresAt; // -1 = no expiry
+        public long expiresAt; // -1 = no expiry; mutable so EXPIRE can update it
 
         Obj(Object value, long expiresAt) {
             this.value = value;
@@ -67,9 +67,26 @@ public class Store {
 
     /**
      * Returns the {@link Obj} for {@code key}, or {@code null} if the key does
-     * not exist. No expiry check here — expiry is checked by the caller.
+     * not exist or has already expired.
+     *
+     * Performs <em>lazy expiry</em>: an expired key is deleted from the store
+     * on first access so memory is reclaimed even without the background cron.
      */
     public static Obj get(String key) {
-        return store.get(key);
+        Obj obj = store.get(key);
+        if (obj != null && obj.expiresAt != -1 && obj.expiresAt <= System.currentTimeMillis()) {
+            store.remove(key);
+            return null;
+        }
+        return obj;
+    }
+
+    /**
+     * Deletes the entry for {@code key}.
+     *
+     * @return {@code true} if the key existed and was removed, {@code false} otherwise
+     */
+    public static boolean del(String key) {
+        return store.remove(key) != null;
     }
 }
