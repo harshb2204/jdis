@@ -23,11 +23,10 @@ buildNumber.properties
 
 # ============================================================
 # Project-specific build output
-# bin/ holds the packaged JAR + dependency libs produced by
-# maven-jar-plugin and maven-dependency-plugin
+# bin/ holds the packaged JAR + dependency libs
 # ============================================================
-bin/*.jar
-bin/libs/
+inmemdb/bin/*.jar
+inmemdb/bin/libs/
 
 # ============================================================
 # Logs & temp files
@@ -55,16 +54,11 @@ out/
 .project
 .settings/
 .factorypath
-bin/
-!bin/*.jar
 
 # ============================================================
 # IDE — VS Code
 # ============================================================
 .vscode/
-.classpath
-.project
-.settings/
 
 # ============================================================
 # OS generated files
