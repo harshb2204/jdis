@@ -7,6 +7,8 @@ import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 
+import java.util.logging.Logger;
+
 /**
  * Netty pipeline stage 2: RedisCmd → RESP response
  *
@@ -17,30 +19,32 @@ import io.netty.channel.SimpleChannelInboundHandler;
  * Marked @Sharable so a single instance can be shared across all
  * connections — safe because it holds no per-connection state.
  *
- * Performance note:
- *   System.out.println is intentionally removed from channelRead0().
- *   It acquires a synchronized lock on every call — at 50k+ req/s
- *   that is 50k lock acquisitions per second on the hot path.
- *   Connect/disconnect logging is kept (low frequency events).
+ * Logging note:
+ *   System.out.println is avoided on the hot path because it acquires
+ *   a synchronized lock on every call. Instead we use java.util.logging
+ *   at INFO level so each command is visible in the server output without
+ *   the synchronization overhead of PrintStream.
  */
 @ChannelHandler.Sharable
 public class CommandHandler extends SimpleChannelInboundHandler<RedisCmd> {
 
+    private static final Logger log = Logger.getLogger(CommandHandler.class.getName());
+
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, RedisCmd cmd) {
-        // Hot path — no logging, no allocation
+        log.info("[" + ctx.channel().remoteAddress() + "] "
+                + cmd.getCmd()
+                + (cmd.getArgs().length > 0 ? " " + String.join(" ", cmd.getArgs()) : ""));
         Eval.evalAndRespond(cmd, ctx);
     }
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) {
-        // Low-frequency event — logging is fine here
         System.out.println("client connected: " + ctx.channel().remoteAddress());
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        // Low-frequency event — logging is fine here
         System.out.println("client disconnected: " + ctx.channel().remoteAddress());
     }
 
