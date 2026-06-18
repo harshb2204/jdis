@@ -2,13 +2,11 @@ package com.inmemdb.core;
 
 /**
  * Encodes values into RESP (Redis Serialization Protocol) format.
- *
- * Encodes values into RESP (Redis Serialization Protocol) format.
  * Supports Simple Strings, Bulk Strings, Integers, and the Nil sentinel.
  */
 public class RESPEncoder {
 
-    /** RESP-encoded nil bulk string — returned when a key does not exist. */
+    /** RESP-encoded nil bulk string — returned when a key does not exist or the type is unknown. */
     public static final byte[] RESP_NIL = "$-1\r\n".getBytes();
 
     /**
@@ -34,5 +32,26 @@ public class RESPEncoder {
      */
     public static byte[] encode(long value) {
         return (":" + value + "\r\n").getBytes();
+    }
+
+    /**
+     * Encodes an arbitrary Object into RESP format.
+     * Dispatches to the appropriate typed overload; returns RESP_NIL for unknown types.
+     *
+     * @param value    the value to encode
+     * @param isSimple passed through to the String overload when value is a String
+     * @return the RESP-encoded byte array
+     */
+    public static byte[] encode(Object value, boolean isSimple) {
+        if (value instanceof String) {
+            return encode((String) value, isSimple);
+        }
+        if (value instanceof Long) {
+            return encode((long) (Long) value);
+        }
+        if (value instanceof Integer) {
+            return encode((long) (Integer) value);
+        }
+        return RESP_NIL;
     }
 }
