@@ -36,17 +36,21 @@ public class Eval {
     private static final ByteBuf TTL_NO_KEY    = staticBuf(":-2\r\n");
     private static final ByteBuf TTL_NO_EXPIRY = staticBuf(":-1\r\n");
 
-    private static final ByteBuf ERR_PING_ARGS = staticBuf(
+    private static final ByteBuf ERR_PING_ARGS   = staticBuf(
             "-ERR wrong number of arguments for 'ping' command\r\n");
-    private static final ByteBuf ERR_SET_ARGS  = staticBuf(
+    private static final ByteBuf ERR_SET_ARGS    = staticBuf(
             "-ERR wrong number of arguments for 'set' command\r\n");
-    private static final ByteBuf ERR_GET_ARGS  = staticBuf(
+    private static final ByteBuf ERR_GET_ARGS    = staticBuf(
             "-ERR wrong number of arguments for 'get' command\r\n");
-    private static final ByteBuf ERR_TTL_ARGS  = staticBuf(
+    private static final ByteBuf ERR_TTL_ARGS    = staticBuf(
             "-ERR wrong number of arguments for 'ttl' command\r\n");
-    private static final ByteBuf ERR_SYNTAX    = staticBuf(
+    private static final ByteBuf ERR_DEL_ARGS    = staticBuf(
+            "-ERR wrong number of arguments for 'del' command\r\n");
+    private static final ByteBuf ERR_EXPIRE_ARGS = staticBuf(
+            "-ERR wrong number of arguments for 'expire' command\r\n");
+    private static final ByteBuf ERR_SYNTAX      = staticBuf(
             "-ERR syntax error\r\n");
-    private static final ByteBuf ERR_NOT_INT   = staticBuf(
+    private static final ByteBuf ERR_NOT_INT     = staticBuf(
             "-ERR value is not an integer or out of range\r\n");
 
     /** Allocates an unreleasable direct buffer pre-filled with the given string. */
@@ -228,6 +232,81 @@ public class Eval {
     }
 
     // -------------------------------------------------------------------------
+    // DEL key [key ...]
+    // -------------------------------------------------------------------------
+
+    /**
+     * DEL key [key ...]
+     *
+     * Removes one or more keys. Returns the number of keys that were actually
+     * deleted (keys that did not exist are ignored).
+     */
+    private static void evalDEL(String[] args, ChannelHandlerContext ctx) {
+        if (args.length == 0) {
+            ctx.writeAndFlush(ERR_DEL_ARGS.duplicate());
+            return;
+        }
+
+        int countDeleted = 0;
+        for (String key : args) {
+            if (Store.del(key)) {
+                countDeleted++;
+            }
+        }
+
+        // Return count as a RESP integer
+        ByteBuf buf = ctx.alloc().buffer(24);
+        buf.writeByte(':');
+        writeAsciiLong(buf, countDeleted);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        ctx.writeAndFlush(buf);
+    }
+
+    // -------------------------------------------------------------------------
+    // EXPIRE key seconds
+    // -------------------------------------------------------------------------
+
+    /**
+     * EXPIRE key seconds
+     *
+     * Sets a timeout on a key. After the timeout the key is automatically deleted.
+     *
+     * Returns:
+     *   1  — timeout was set successfully
+     *   0  — key does not exist (timeout not set)
+     */
+    private static void evalEXPIRE(String[] args, ChannelHandlerContext ctx) {
+        if (args.length <= 1) {
+            ctx.writeAndFlush(ERR_EXPIRE_ARGS.duplicate());
+            return;
+        }
+
+        String key = args[0];
+        long exDurationSec;
+        try {
+            exDurationSec = Long.parseLong(args[1]);
+        } catch (NumberFormatException e) {
+            ctx.writeAndFlush(ERR_NOT_INT.duplicate());
+            return;
+        }
+
+        Store.Obj obj = Store.get(key);
+
+        // Key does not exist → return 0
+        if (obj == null) {
+            ctx.writeAndFlush(staticBuf(":0\r\n").duplicate());
+            return;
+        }
+
+        // Update the expiry on the existing object
+        obj.expiresAt = System.currentTimeMillis() + exDurationSec * 1000;
+
+        // Timeout was set → return 1
+        ctx.writeAndFlush(staticBuf(":1\r\n").duplicate());
+    }
+
+    // -------------------------------------------------------------------------
     // Dispatch
     // -------------------------------------------------------------------------
 
@@ -250,6 +329,12 @@ public class Eval {
                 break;
             case "TTL":
                 evalTTL(cmd.getArgs(), ctx);
+                break;
+            case "DEL":
+                evalDEL(cmd.getArgs(), ctx);
+                break;
+            case "EXPIRE":
+                evalEXPIRE(cmd.getArgs(), ctx);
                 break;
             default:
                 evalPING(cmd.getArgs(), ctx);
