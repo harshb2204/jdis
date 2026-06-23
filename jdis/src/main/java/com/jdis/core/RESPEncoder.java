@@ -35,6 +35,26 @@ public class RESPEncoder {
     }
 
     /**
+     * Encodes a String array as a RESP Array of Bulk Strings.
+     * Format: *<count>\r\n$<len>\r\n<value>\r\n...
+     *
+     * This is used for AOF persistence — each command is serialized as
+     * a RESP array so it can be replayed on startup.
+     *
+     * @param values the string array to encode
+     * @return the RESP-encoded byte array
+     */
+    public static byte[] encodeStringArray(String[] values) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('*').append(values.length).append("\r\n");
+        for (String v : values) {
+            sb.append('$').append(v.length()).append("\r\n");
+            sb.append(v).append("\r\n");
+        }
+        return sb.toString().getBytes();
+    }
+
+    /**
      * Encodes an arbitrary Object into RESP format.
      * Dispatches to the appropriate typed overload; returns RESP_NIL for unknown types.
      *

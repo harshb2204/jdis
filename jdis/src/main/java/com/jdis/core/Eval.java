@@ -307,6 +307,23 @@ public class Eval {
     }
 
     // -------------------------------------------------------------------------
+    // BGREWRITEAOF
+    // -------------------------------------------------------------------------
+
+    /**
+     * BGREWRITEAOF
+     *
+     * Rewrites the AOF (Append-Only File) by dumping the entire in-memory store
+     * to disk as RESP-encoded SET commands.
+     *
+     * TODO: Make it async by forking a new thread.
+     */
+    private static void evalBGREWRITEAOF(String[] args, ChannelHandlerContext ctx) {
+        AOF.dumpAllAOF();
+        ctx.write(OK_RESPONSE.duplicate());
+    }
+
+    // -------------------------------------------------------------------------
     // Dispatch
     // -------------------------------------------------------------------------
 
@@ -335,6 +352,9 @@ public class Eval {
                 break;
             case "EXPIRE":
                 evalEXPIRE(cmd.getArgs(), ctx);
+                break;
+            case "BGREWRITEAOF":
+                evalBGREWRITEAOF(cmd.getArgs(), ctx);
                 break;
             default:
                 evalPING(cmd.getArgs(), ctx);
