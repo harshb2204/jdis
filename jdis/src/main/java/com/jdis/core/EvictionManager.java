@@ -1,18 +1,19 @@
 package com.jdis.core;
 
+import java.util.Iterator;
+
 import com.jdis.config.Config;
 
 /**
  * Handles eviction of keys from the store when the number of keys
  * exceeds the configured limit ({@link Config#KEYS_LIMIT}).
  *
- * Currently supports:
- * <ul>
- *   <li><b>simple-first</b> — evicts the first key found while iterating the store</li>
- * </ul>
- *
- * TODO: Make the eviction strategy fully configuration-driven.
- * TODO: Support multiple eviction strategies (LRU, LFU, random, etc.).
+ * Supports:
+ * 
+ *   simple-first — evicts the first key found while iterating the store
+ *   allkeys-random — randomly removes keys to free up space based on
+ *       {@link Config#EVICTION_RATIO
+ * 
  */
 public class EvictionManager {
 
@@ -24,9 +25,30 @@ public class EvictionManager {
      * TODO: Make it more efficient by doing thorough sampling.
      */
     private static void evictFirst() {
-        for (String key : Store.store.keySet()) {
-            Store.store.remove(key);
-            return;
+        Iterator<String> it = Store.store.keySet().iterator();
+        if (it.hasNext()) {
+            String key = it.next();
+            it.remove();
+            KeyspaceStat.decrementStat(0, "keys");
+        }
+    }
+
+    /**
+     * Randomly removes keys to make space for the new data added.
+     * The number of keys removed will be sufficient to free up at least
+     * {@link Config#EVICTION_RATIO} fraction of {@link Config#KEYS_LIMIT} keys.
+     *
+     * Iteration of Java HashMap can be considered pseudo-random because it
+     * depends on the hash of the inserted key 
+     */
+    private static void evictAllkeysRandom() {
+        long evictCount = (long) (Config.EVICTION_RATIO * Config.KEYS_LIMIT);
+        Iterator<String> it = Store.store.keySet().iterator();
+        while (it.hasNext() && evictCount > 0) {
+            it.next();
+            it.remove();
+            KeyspaceStat.decrementStat(0, "keys");
+            evictCount--;
         }
     }
 
@@ -39,6 +61,9 @@ public class EvictionManager {
         switch (Config.EVICTION_STRATEGY) {
             case "simple-first":
                 evictFirst();
+                break;
+            case "allkeys-random":
+                evictAllkeysRandom();
                 break;
             default:
                 // Unknown strategy — fall back to simple-first
