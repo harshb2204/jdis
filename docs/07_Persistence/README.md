@@ -33,10 +33,10 @@ The commands are logged in RESP format itself making it super simple to read and
 
 ```text
 AOF File        Dataset      Rewritten AOF
-SET K V1   \
-SET K V2    |-> { K: V4 } -> BGREWRITEAOF -> SET K V4
-SET K V3    |
-SET K V4   /
+SET K V1   
+SET K V2    -> { K: V4 }  -> BGREWRITEAOF -> SET K V4
+SET K V3    
+SET K V4   
 ```
 
 - AOF are much more durable.
