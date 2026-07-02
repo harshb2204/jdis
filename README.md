@@ -10,16 +10,20 @@ Building a simplified Redis from scratch in Java to understand its internals —
 
 This project is a ground-up implementation of a Redis-compatible in-memory database server in Java. The goal is to understand how Redis works internally — starting from raw TCP socket handling, the RESP wire protocol, and building up toward a full key-value store.
 
-The current implementation (`inmemdb/`) is **Phase 3**: a high-performance, fully concurrent TCP server built on **Netty** with native **epoll** (Linux/WSL) that:
+The current implementation (`jdis/`) is **Phase 3**: a high-performance, fully concurrent TCP server built on **Netty** with native **epoll** (Linux/WSL) that:
 - Listens on a configurable host/port (default `0.0.0.0:7379`)
 - Accepts and handles **thousands of concurrent clients** in a single thread using epoll I/O multiplexing
 - Uses Netty's **native epoll transport** on Linux/WSL (edge-triggered, zero-copy, pooled off-heap buffers)
 - Parses incoming data as RESP protocol (from `redis-cli`) or inline commands (from `telnet`)
 - Handles TCP fragmentation automatically — partial reads are buffered and retried
 - Evaluates commands and responds with proper RESP-encoded responses
-- Supports `PING`, `SET` (with optional `EX` expiry), `GET`, and `TTL` with full Redis-compatible behavior
+- Supports `PING`, `SET` (with optional `EX` expiry), `GET`, `TTL`, `DEL`, `EXPIRE`, `INCR`, `INFO`, `CLIENT`, `LATENCY`, and `BGREWRITEAOF` with full Redis-compatible behavior
+- Implements **Redis Object type/encoding** — values are tagged with type (STRING) and encoding (INT, EMBSTR, RAW) for type-safe operations
 - Includes a RESP protocol decoder and encoder
 - Maintains an in-memory key-value store with optional per-key TTL (time-to-live)
+- **Evicts keys** when the store reaches its configured capacity using a pluggable eviction strategy (supports: `simple-first` and `allkeys-random`)
+- Tracks **keyspace statistics** (key count per logical database) for monitoring via the `INFO` command
+- Supports **command pipelining** — multiple commands sent in a single TCP segment are decoded, evaluated, and their responses flushed in a single write syscall
 
 ### Evolution of the server
 
@@ -34,24 +38,29 @@ The current implementation (`inmemdb/`) is **Phase 3**: a high-performance, full
 ## Project Structure
 
 ```
-inmemdb/
+jdis/
 ├── pom.xml                          # Maven build file (includes Netty dependencies)
 ├── bin/
-│   ├── inmemdb.jar                  # Pre-built executable JAR
+│   ├── jdis.jar                  # Pre-built executable JAR
 │   └── libs/                        # Netty and dependency JARs (auto-copied by Maven)
 └── src/
     └── main/
         └── java/
-            └── com/inmemdb/
+            └── com/jdis/
                 ├── Main.java                        # Entry point — parses CLI args, starts server
                 ├── config/
-                │   └── Config.java                  # Global config (HOST, PORT)
-                ├── core/
-                │   ├── Store.java                    # In-memory key-value store (Obj, put, get)
-                │   ├── RESPDecoder.java              # RESP protocol parser (decode)
-                │   ├── RESPEncoder.java              # RESP protocol encoder (encode responses)
-                │   ├── RedisCmd.java                 # Command object (cmd + args)
-                │   └── Eval.java                    # Command evaluator — PING, SET, GET, TTL
+                │   └── Config.java                  # Global config (HOST, PORT, KEYS_LIMIT, EVICTION_STRATEGY, AOF_FILE)
+                 ├── core/
+                 │   ├── Store.java                    # In-memory key-value store (Obj, put, get, del)
+                 │   ├── KeyspaceStat.java             # Keyspace statistics tracker (key counts per DB)
+                 │   ├── EvictionManager.java          # Eviction logic — simple-first + allkeys-random
+                 │   ├── ExpiryManager.java            # Active expiry cron — background key deletion
+                 │   ├── ObjTypeEncoding.java           # Redis Object type/encoding constants + utilities
+                 │   ├── AOF.java                      # AOF persistence — dumps store to disk as RESP commands
+                 │   ├── RESPDecoder.java              # RESP protocol parser (decode)
+                 │   ├── RESPEncoder.java              # RESP protocol encoder (encode responses + encodeStringArray)
+                 │   ├── RedisCmd.java                 # Command object (cmd + args)
+                 │   └── Eval.java                    # Command evaluator — PING, SET, GET, TTL, DEL, EXPIRE, INCR, INFO, CLIENT, LATENCY, BGREWRITEAOF
                 └── server/
                     ├── NettyTCPServer.java           # ← Active server: Netty + native epoll
                     ├── AsyncTCPServer.java           # Reference: NIO Selector (level-triggered epoll)
@@ -75,14 +84,14 @@ inmemdb/
 ### Option 1 — Build from source and run
 
 ```bash
-# Navigate to the inmemdb directory
-cd inmemdb
+# Navigate to the jdis directory
+cd jdis
 
 # Build the project (compiles, packages JAR, copies Netty libs to bin/libs/)
 mvn package
 
 # Run the JAR
-java -jar bin/inmemdb.jar
+java -jar bin/jdis.jar
 ```
 
 ---
@@ -90,7 +99,7 @@ java -jar bin/inmemdb.jar
 ### Option 2 — Run with custom host/port
 
 ```bash
-java -jar bin/inmemdb.jar --host 127.0.0.1 --port 6379
+java -jar bin/jdis.jar --host 127.0.0.1 --port 6379
 ```
 
 ---
@@ -125,7 +134,7 @@ redis-cli -h 172.17.32.1 -p 7379
 
 ```bash
 # Build and run inside WSL — this activates Netty's native epoll transport
-cd inmemdb && mvn package -q && java -jar bin/inmemdb.jar
+cd jdis && mvn package -q && java -jar bin/jdis.jar
 ```
 
 You should see output like:
@@ -136,6 +145,68 @@ ready to accept connections on 0.0.0.0:7379
 ```
 
 > When running on Windows (not WSL), the transport line will say `[transport: NIO]` — Netty automatically falls back to Java NIO since native epoll is Linux-only.
+
+---
+
+### Try DEL, EXPIRE
+
+**Using `redis-cli`** (human-friendly output):
+```
+# DEL a single key
+127.0.0.1:7379> SET name harsh
+OK
+127.0.0.1:7379> DEL name
+(integer) 1
+127.0.0.1:7379> GET name
+(nil)
+
+# DEL multiple keys at once — returns count of keys actually deleted
+127.0.0.1:7379> SET a 1
+OK
+127.0.0.1:7379> SET b 2
+OK
+127.0.0.1:7379> DEL a b ghost
+(integer) 2
+
+# DEL a key that doesn't exist → 0
+127.0.0.1:7379> DEL nonexistent
+(integer) 0
+
+# EXPIRE — set a TTL on an already-existing key (no EX needed at SET time)
+127.0.0.1:7379> SET city tokyo
+OK
+127.0.0.1:7379> TTL city
+(integer) -1
+127.0.0.1:7379> EXPIRE city 10
+(integer) 1
+127.0.0.1:7379> TTL city
+(integer) 9
+
+# EXPIRE on a key that doesn't exist → 0
+127.0.0.1:7379> EXPIRE ghost 30
+(integer) 0
+
+# EXPIRE wrong args
+127.0.0.1:7379> EXPIRE city
+(error) ERR wrong number of arguments for 'expire' command
+127.0.0.1:7379> EXPIRE city notanumber
+(error) ERR value is not an integer or out of range
+```
+
+**Using `telnet`** (raw RESP output):
+```
+DEL name
+:1
+DEL a b ghost
+:2
+EXPIRE city 10
+:1
+EXPIRE ghost 30
+:0
+```
+
+The RESP types used:
+- `:N` → RESP Integer — `DEL` returns the count of deleted keys; `EXPIRE` returns `1` (set) or `0` (key not found)
 
 ---
 
@@ -271,6 +342,19 @@ redis-benchmark -n 100000 -t ping_mbulk -c 50 -P 1 -h 172.17.32.1 -p 7379
 
 ---
 
+### Benchmark DEL and EXPIRE
+
+```bash
+# Benchmark DEL (from WSL)
+redis-benchmark -n 100000 -t del -c 50 -P 1 -h 172.17.32.1 -p 7379
+
+# Benchmark SET+EXPIRE pipeline
+redis-benchmark -n 100000 -c 50 -P 1 -h 172.17.32.1 -p 7379 \
+  -e --dbnum 0 --command "SET foo bar" --command "EXPIRE foo 60"
+```
+
+---
+
 ## Code Walkthrough
 
 ### `Main.java` — Entry Point
@@ -309,14 +393,18 @@ public class Main {
 public class Config {
     public static String HOST = "0.0.0.0";
     public static int PORT = 7379;
+    public static int KEYS_LIMIT = 5;
+    public static String EVICTION_STRATEGY = "simple-first";
 }
 ```
 
 **What it does:**
 
-- Holds two `public static` mutable fields that act as global configuration for the entire application.
+- Holds `public static` mutable fields that act as global configuration for the entire application.
 - `HOST = "0.0.0.0"` means "bind to all available network interfaces" — the server will accept connections from any IP address on the machine, not just localhost.
 - `PORT = 7379` is the default port. Redis uses `6379`; this project uses `7379` to avoid conflicts with a running Redis instance.
+- `KEYS_LIMIT = 5` — the maximum number of keys allowed in the store before eviction kicks in. When `Store.put()` is called and the store already has `KEYS_LIMIT` keys, one key is evicted to make room. Set low (5) for easy testing; in production Redis this would be governed by `maxmemory`.
+- `EVICTION_STRATEGY = "simple-first"` — which eviction algorithm to use. Currently only `simple-first` is supported (evicts an arbitrary key). This is the extension point for future strategies like LRU, LFU, random, etc.
 - Because these are plain `static` fields (not `final`), `Main.setupFlags()` can overwrite them before the server starts.
 
 ---
@@ -329,10 +417,16 @@ This is the heart of Phase 3. It sets up a Netty `ServerBootstrap` with a **sing
 public static void run() throws InterruptedException {
     boolean useEpoll = Epoll.isAvailable();
 
-    // One thread handles everything: accept + all I/O — same as Redis
+    // One thread handles everything: accept + all I/O + expiry cron — same as Redis
     EventLoopGroup group = useEpoll
             ? new EpollEventLoopGroup(1)
             : new NioEventLoopGroup(1);
+
+    // Schedule the expiry cron on the event loop thread — not a separate thread
+    group.scheduleAtFixedRate(
+        ExpiryManager::deleteExpiredKeys,
+        1, 1, TimeUnit.SECONDS
+    );
 
     ServerBootstrap bootstrap = new ServerBootstrap();
     bootstrap
@@ -414,8 +508,12 @@ public class RESPCommandDecoder extends ByteToMessageDecoder {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        // Need at least 1 byte to determine the format
         if (in.readableBytes() < 1) return;
+
+        // Peek at the first byte without consuming it
         byte firstByte = in.getByte(in.readerIndex());
+
         if (firstByte == '*') {
             decodeRESPArray(in, out);
         } else {
@@ -438,43 +536,130 @@ TCP is a stream protocol — there is no concept of "message boundaries". A sing
 
 ```java
 private void decodeRESPArray(ByteBuf in, List<Object> out) {
-    in.markReaderIndex();  // save position — reset here if we don't have a full frame
+    // Mark the reader index so we can reset if we don't have a full frame yet
+    in.markReaderIndex();
 
-    in.readByte();         // consume '*'
-    int count = readInteger(in);  // e.g. *2 → count = 2
-    if (count < 0) { in.resetReaderIndex(); return; }  // not enough data yet
+    // Read '*'
+    in.readByte();
+
+    // Read the array element count
+    int count = readInteger(in);
+    if (count < 0) {
+        in.resetReaderIndex();
+        return; // not enough data yet
+    }
 
     List<String> tokens = new ArrayList<>(count);
     for (int i = 0; i < count; i++) {
-        in.readByte();             // consume '$'
-        int len = readInteger(in); // e.g. $4 → len = 4
-        if (in.readableBytes() < len + 2) { in.resetReaderIndex(); return; }
-        String token = in.readCharSequence(len, UTF_8).toString();
-        in.skipBytes(2);           // skip \r\n after the bulk string data
+        // Expect '$'
+        if (in.readableBytes() < 1) {
+            in.resetReaderIndex();
+            return;
+        }
+        byte marker = in.readByte();
+        if (marker != '$') {
+            in.resetReaderIndex();
+            return;
+        }
+
+        // Read bulk string length
+        int len = readInteger(in);
+        if (len < 0) {
+            in.resetReaderIndex();
+            return;
+        }
+
+        // Need len bytes + \r\n
+        if (in.readableBytes() < len + 2) {
+            in.resetReaderIndex();
+            return;
+        }
+
+        String token = in.readCharSequence(len, StandardCharsets.UTF_8).toString();
+        in.skipBytes(2); // skip \r\n
         tokens.add(token);
     }
 
-    out.add(new RedisCmd(tokens.get(0).toUpperCase(), /* rest as args */));
+    if (tokens.isEmpty()) return;
+
+    String cmd   = tokens.get(0).toUpperCase();
+    String[] args = tokens.subList(1, tokens.size()).toArray(new String[0]);
+    out.add(new RedisCmd(cmd, args));
 }
 ```
 
 - `markReaderIndex()` / `resetReaderIndex()`: If at any point there aren't enough bytes to complete the frame, the reader position is reset to the start of the command. Netty will call `decode()` again when more bytes arrive.
+- **Marker byte validation**: Before reading each bulk string, the code checks that the next byte is `$`. If not (malformed input), it resets and waits.
+- **Three-level guard**: Each element requires three checks before proceeding: (1) at least 1 byte available for the `$` marker, (2) the length integer is fully available, (3) `len + 2` bytes available for the data + `\r\n`. Failing at any point resets to the start.
 - `readCharSequence(len, UTF_8)`: Reads exactly `len` bytes as a string — safe for binary data and strings containing `\r\n`.
 
 **Inline decoding (telnet support):**
 
 ```java
 private void decodeInline(ByteBuf in, List<Object> out) {
+    // Find the end of the line
     int lineEnd = findLineEnd(in);
-    if (lineEnd < 0) return;  // no \n found yet — wait for more data
+    if (lineEnd < 0) return; // not a full line yet
 
-    String line = in.readCharSequence(lineEnd - in.readerIndex(), UTF_8).toString().trim();
-    // skip \r\n, split by whitespace, build RedisCmd
+    int lineLen = lineEnd - in.readerIndex();
+    String line = in.readCharSequence(lineLen, StandardCharsets.UTF_8).toString().trim();
+
+    // Skip \r\n or \n
+    if (in.readableBytes() > 0 && in.getByte(in.readerIndex()) == '\r') in.readByte();
+    if (in.readableBytes() > 0 && in.getByte(in.readerIndex()) == '\n') in.readByte();
+
+    if (line.isEmpty()) return;
+
+    String[] parts = line.split("\\s+");
+    String cmd    = parts[0].toUpperCase();
+    String[] args = new String[parts.length - 1];
+    System.arraycopy(parts, 1, args, 0, args.length);
+    out.add(new RedisCmd(cmd, args));
 }
 ```
 
-- Scans for a `\n` byte. If not found, returns without consuming anything — waits for more data.
-- Once a full line is available, splits it by whitespace to get command + args.
+- Scans for a `\n` byte using `findLineEnd()`. If not found, returns without consuming anything — waits for more data.
+- Reads the line up to (but not including) the `\n`, then manually skips `\r` and `\n` bytes.
+- Splits the trimmed line by whitespace (`\\s+`) to get command + args.
+- Uses `System.arraycopy` to efficiently extract args into a separate array.
+
+**Helper methods:**
+
+```java
+private int readInteger(ByteBuf in) {
+    int startIndex = in.readerIndex();
+    int value = 0;
+    while (in.readableBytes() > 0) {
+        byte b = in.readByte();
+        if (b == '\r') {
+            if (in.readableBytes() < 1) {
+                in.readerIndex(startIndex);
+                return -1;
+            }
+            in.readByte(); // consume \n
+            return value;
+        }
+        if (b >= '0' && b <= '9') {
+            value = value * 10 + (b - '0');
+        }
+    }
+    in.readerIndex(startIndex);
+    return -1; // not enough data
+}
+
+private int findLineEnd(ByteBuf in) {
+    int i = in.readerIndex();
+    int end = in.writerIndex();
+    while (i < end) {
+        if (in.getByte(i) == '\n') return i;
+        i++;
+    }
+    return -1;
+}
+```
+
+- `readInteger()` reads ASCII digit bytes one by one, building the integer value. If it runs out of data before finding `\r\n`, it resets the reader index and returns `-1` to signal "not enough data".
+- `findLineEnd()` scans the buffer for the next `\n` byte without consuming anything — used by `decodeInline()` to check if a full line is available.
 
 **Note on `@Sharable`:**
 
@@ -484,16 +669,32 @@ private void decodeInline(ByteBuf in, List<Object> out) {
 
 ### `CommandHandler.java` — Netty Pipeline Stage 2
 
-Receives fully-decoded `RedisCmd` objects and dispatches them to `Eval`.
+Receives fully-decoded `RedisCmd` objects, dispatches them to `Eval`, and implements **pipelining** by batching all responses and flushing them in a single write syscall.
 
 ```java
 @ChannelHandler.Sharable
 public class CommandHandler extends SimpleChannelInboundHandler<RedisCmd> {
 
+    private static final Logger log = Logger.getLogger(CommandHandler.class.getName());
+
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, RedisCmd cmd) {
-        System.out.println("command: " + cmd.getCmd());
+        log.info("[" + ctx.channel().remoteAddress() + "] "
+                + cmd.getCmd()
+                + (cmd.getArgs().length > 0 ? " " + String.join(" ", cmd.getArgs()) : ""));
+        // Write response without flushing — pipelining batches all responses
+        // and flushes them together in channelReadComplete()
         Eval.evalAndRespond(cmd, ctx);
+    }
+
+    /**
+     * Called once after ALL messages from a single read event have been
+     * processed by channelRead0(). This is where we flush all buffered
+     * responses in a single write syscall — the key to pipelining performance.
+     */
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) {
+        ctx.flush();
     }
 
     @Override
@@ -518,10 +719,27 @@ public class CommandHandler extends SimpleChannelInboundHandler<RedisCmd> {
 **What it does:**
 
 - `SimpleChannelInboundHandler<RedisCmd>`: A Netty base class that only fires `channelRead0()` when the inbound message is of type `RedisCmd`. It also automatically releases the message's reference count after `channelRead0()` returns (Netty uses reference-counted buffers).
-- `channelRead0()`: The hot path. Called once per fully-decoded command. Delegates to `Eval.evalAndRespond()`.
-- `channelActive()` / `channelInactive()`: Lifecycle hooks — called when a client connects or disconnects. Used for logging.
+- **`channelRead0()`**: The hot path. Called once per fully-decoded command. Logs the command with the client's remote address and full arguments using `java.util.logging.Logger`, then delegates to `Eval.evalAndRespond()`. Note that `Eval` calls `ctx.write()` (without flush) — the response is buffered in Netty's outbound queue.
+- **`channelReadComplete()`**: The pipelining flush point. Called **once** after all messages from a single `epoll_wait()` read event have been processed through `channelRead0()`. Calls `ctx.flush()` to send all buffered responses in a single write syscall. If a client pipelined 10 commands, `channelRead0()` fires 10 times (10× `ctx.write()`), then `channelReadComplete()` fires once (1× `ctx.flush()`) — resulting in 1 syscall instead of 10.
+- `channelActive()` / `channelInactive()`: Lifecycle hooks — called when a client connects or disconnects. Used for connection logging.
 - `exceptionCaught()`: Called when an unhandled exception occurs in the pipeline. Logs the error and closes the channel.
 - `@Sharable`: Safe to mark because this handler holds no per-connection state — a single instance is shared across all connections.
+
+**Pipelining mechanics:**
+
+The split between `ctx.write()` and `ctx.flush()` is the key to pipelining:
+
+| Method | What happens | Syscalls |
+|--------|-------------|----------|
+| `ctx.write(buf)` | Buffers the response in Netty's outbound queue | 0 |
+| `ctx.flush()` | Flushes all queued writes to the network | 1 |
+
+When a client sends 3 pipelined commands in one TCP segment:
+1. `RESPCommandDecoder.decode()` is called in a loop → produces 3 `RedisCmd` objects
+2. `channelRead0()` fires 3 times → each calls `Eval.evalAndRespond()` → 3× `ctx.write()` (buffered)
+3. `channelReadComplete()` fires once → `ctx.flush()` → all 3 responses sent in 1 write syscall
+
+This is the Netty equivalent of collecting all responses into a buffer and writing them all at once.
 
 ---
 
@@ -1018,6 +1236,1005 @@ The `isSimple` flag on the string overload determines which RESP type to use:
 
 ---
 
+### `ExpiryManager.java` — Active Expiry
+
+Redis uses a **two-pronged approach** to expiry. This class implements the second prong — the active cron.
+
+#### The Two Strategies
+
+| Strategy | When it runs | How it works | Limitation |
+|----------|-------------|--------------|------------|
+| **Lazy expiry** | On every `GET` / `TTL` read | `Store.get()` checks `expiresAt` and deletes if expired | Memory not freed until the key is touched again |
+| **Active expiry** | Every 1 second (event loop) | `ExpiryManager` samples keys and deletes expired ones | Probabilistic — not every expired key is found immediately |
+
+Together they guarantee: expired keys are **never returned to clients** (lazy), and **memory is eventually reclaimed** even for keys that are never read again (active).
+
+#### Threading Model — Faithful to Redis
+
+This is the key architectural decision. `ExpiryManager` contains **no threads of its own**. It is a pure logic class — `deleteExpiredKeys()` is just a method.
+
+The scheduling is done in `NettyTCPServer` using `group.scheduleAtFixedRate()`:
+
+```java
+group.scheduleAtFixedRate(
+    ExpiryManager::deleteExpiredKeys,
+    1, 1, TimeUnit.SECONDS
+);
+```
+
+`scheduleAtFixedRate()` on a Netty `EventLoopGroup` queues the task onto the **I/O thread's own task queue**. Netty drains this queue between `epoll_wait()` wakeups — so the cron fires on the **same thread** as `channelRead0()`, `evalSET()`, `evalGET()`, etc.
+
+This is exactly how Redis does it:
+
+```
+Redis event loop:              Our Netty event loop:
+  loop:                          loop:
+    serverCron()  ← expiry          [drain task queue]  ← expiry fires here
+    epoll_wait()                    epoll_wait()
+    handle events                   handle events (channelRead0, etc.)
+```
+
+**Why this matters:**
+
+Because the cron and all command handlers run on the same single thread, the store `HashMap` is only ever touched by one thread at a time — zero concurrency, zero races, no `ConcurrentHashMap` needed. This is the same reason Redis doesn't need locks on its hash table.
+
+#### The Sampling Algorithm
+
+The algorithm mirrors what Redis does:
+
+```
+loop:
+  1. Walk the store, pick up to 20 keys that have an expiry set
+  2. Delete any of those that have already expired
+  3. expiredFraction = deletedCount / 20
+
+  if expiredFraction >= 0.25:
+      go back to step 1  ← store is "dirty", keep cleaning immediately
+  else:
+      return             ← store looks clean, wait for next scheduled tick
+```
+
+**Why sample instead of scanning everything?**
+
+Scanning the entire store on every tick is O(n) — for a store with 10 million keys, that's 10 million comparisons every second, which would consume significant CPU. Redis's insight is:
+
+- If a random sample of 20 keys has **< 25% expired**, the overall store is probably clean enough — stop.
+- If **≥ 25%** of the sample is expired, the store is "hot with expiry" — loop immediately without waiting for the next tick.
+
+This keeps CPU usage near zero when there are few expired keys, and ramps up automatically when there are many.
+
+```java
+public class ExpiryManager {
+
+    static final int   SAMPLE_SIZE      = 20;
+    static final float EXPIRY_THRESHOLD = 0.25f;
+
+    // No threads here — scheduled on the Netty event loop in NettyTCPServer
+    public static void deleteExpiredKeys() {
+        while (true) {
+            float fraction = expireSample();
+            if (fraction < EXPIRY_THRESHOLD) break;
+            // ≥25% expired → loop again immediately
+        }
+    }
+
+    private static float expireSample() {
+        // Step 1: snapshot all entries into an array so we can index randomly
+        Object[] entries = Store.store.entrySet().toArray();  // O(n), shallow copy
+        if (entries.length == 0) return 0f;
+
+        long now = System.currentTimeMillis();
+        List<String> toDelete = new ArrayList<>();
+        int sampledWithExpiry = 0, expiredCount = 0;
+        int attempts = 0, maxAttempts = entries.length * 2;
+
+        // Step 2: pick random indices until we have SAMPLE_SIZE keys with expiry
+        while (sampledWithExpiry < SAMPLE_SIZE && attempts < maxAttempts) {
+            int idx = ThreadLocalRandom.current().nextInt(entries.length);
+            Map.Entry<String, Store.Obj> entry = (Map.Entry<String, Store.Obj>) entries[idx];
+            attempts++;
+
+            if (entry.getValue().expiresAt == -1) continue;  // no expiry — skip
+            sampledWithExpiry++;
+
+            if (entry.getValue().expiresAt <= now) {
+                toDelete.add(entry.getKey());
+                expiredCount++;
+            }
+        }
+
+        // Step 3: delete expired keys (two-pass to avoid ConcurrentModificationException)
+        for (String key : toDelete) Store.store.remove(key);
+        return (float) expiredCount / SAMPLE_SIZE;
+    }
+}
+```
+
+**Key design decisions:**
+
+- **No thread in ExpiryManager** — the class is pure logic. Threading is the caller's responsibility (`NettyTCPServer`). This keeps concerns separated and makes the expiry logic independently testable.
+- **True random sampling via `toArray()` + `ThreadLocalRandom`** — `entrySet().toArray()` snapshots all entries into an `Object[]` (O(n), shallow — only references copied, no values). Then `ThreadLocalRandom.current().nextInt(entries.length)` picks uniformly random indices. This gives true random sampling, unlike the original hash-order iteration.
+- **`maxAttempts` guard** — if most keys have no expiry, random picks will keep landing on non-expiring keys. `maxAttempts = entries.length * 2` caps the loop so we don't spin forever on a store where almost nothing has a TTL.
+- **Two-pass deletion** — keys to delete are collected into `toDelete` first, then removed. Removing entries while iterating throws `ConcurrentModificationException` — the two-pass approach avoids this.
+- **Skips non-expiring keys** — only keys with `expiresAt != -1` count against `sampledWithExpiry`. This ensures the sample is representative of keys that *could* expire, not diluted by the majority of keys with no TTL.
+- **`Store.store` package-private access** — `ExpiryManager` is in the same package (`com.jdis.core`) as `Store`, so it can access the `store` map directly. This avoids adding a public API to `Store` just for the cron.
+
+#### Why not just shuffle?
+
+You might think: collect all expiring keys into a list, `Collections.shuffle()`, take the first 20. That works but it's O(n) to collect *and* O(n) to shuffle — worse than `toArray()` + random index picks, which is O(n) to snapshot and O(SAMPLE_SIZE) to sample.
+
+#### What Redis actually does (the ideal)
+
+Redis maintains a **separate `expires` dict** alongside the main key-value dict. Every key that has a TTL is also stored in `expires`. Sampling then picks a random bucket from `expires` directly — O(1), no full scan needed. The Java equivalent would be a separate `List<String> expiringKeys` that is kept in sync with the store on every `SET ... EX` and `EXPIRE` call.
+
+---
+
+### `EvictionManager.java` — Key Eviction
+
+When the store reaches its maximum capacity (`Config.KEYS_LIMIT`), we need to remove existing keys to make room for new ones. This is **eviction** — fundamentally different from expiry:
+
+| Mechanism | Trigger | Purpose |
+|-----------|---------|---------|
+| **Expiry** | A key's TTL has elapsed | Remove stale data that the user explicitly marked as temporary |
+| **Eviction** | Store is full (`store.size() >= KEYS_LIMIT`) | Free memory so new keys can be stored — even if existing keys haven't expired |
+
+#### The Eviction Strategy — `simple-first`
+
+```java
+public class EvictionManager {
+
+    /**
+     * Evicts the first key found while iterating the store map.
+     * Since HashMap iteration order is not guaranteed, this effectively
+     * removes an arbitrary key.
+     */
+    private static void evictFirst() {
+        for (String key : Store.store.keySet()) {
+            Store.store.remove(key);
+            return;
+        }
+    }
+
+    /**
+     * Triggers eviction based on the configured eviction strategy.
+     */
+    public static void evict() {
+        switch (Config.EVICTION_STRATEGY) {
+            case "simple-first":
+                evictFirst();
+                break;
+            default:
+                evictFirst();
+                break;
+        }
+    }
+}
+```
+
+**How it works:**
+
+- `evictFirst()` iterates the store's `keySet()`, grabs the **first key** it encounters, removes it from the store, and immediately returns. Since `HashMap` does not guarantee iteration order, the "first" key is effectively arbitrary — it depends on the internal hash table bucket layout.
+- `evict()` is a strategy dispatcher. It reads `Config.EVICTION_STRATEGY` and routes to the appropriate eviction method. Currently only `"simple-first"` is supported; the `switch` makes it trivial to add more strategies later.
+
+**Where it's called — `Store.put()`:**
+
+```java
+public static void put(String key, Obj obj) {
+    if (store.size() >= Config.KEYS_LIMIT) {
+        EvictionManager.evict();
+    }
+    store.put(key, obj);
+}
+```
+
+Before every write, `put()` checks whether the store has reached its capacity. If so, it calls `EvictionManager.evict()` to remove one key, then proceeds with the insert. This ensures the store **never exceeds** `KEYS_LIMIT` keys.
+
+**Key design decisions:**
+
+- **Eviction happens synchronously inside `put()`** — no background thread, no queue. This is the same model Redis uses: eviction is triggered inline during a write command, blocking the response until space is freed.
+- **`Store.store.keySet()` access** — `EvictionManager` is in the same package (`com.jdis.core`) as `Store`, so it can access the package-private `store` map directly.
+- **Strategy pattern via config** — the `switch` on `Config.EVICTION_STRATEGY` makes it easy to plug in new strategies (e.g., `"allkeys-random"`, `"allkeys-lru"`) without changing the call site in `Store.put()`.
+
+#### What Redis actually does
+
+Redis supports 8 eviction policies (e.g., `volatile-lru`, `allkeys-lfu`, `volatile-ttl`). The `simple-first` strategy here is a simplified starting point — it's essentially `allkeys-random` with a sample size of 1.
+
+---
+
+### Approximated LRU Eviction (`allkeys-lru`)
+
+![](/diagrams/approxlrujdis.png)
+
+
+Redis does **not** use a true LRU implementation because maintaining a doubly-linked list with prev/next pointers per key is too expensive in memory and requires constant reshuffling on every access. Instead, Redis uses an **Approximated LRU** algorithm that achieves near-optimal eviction with only **24 bits of extra storage per object**.
+
+Our implementation adds the `allkeys-lru` eviction strategy, which is now the **default** strategy.
+
+#### How It Works — The 24-Bit LRU Clock
+
+Every stored object carries a `lastAccessedAt` field — the lower 24 bits of the current Unix time in seconds, captured when the key is read or written:
+
+```java
+// LRUClock.java
+public static int getCurrentClock() {
+    return (int) (System.currentTimeMillis() / 1000) & 0x00FFFFFF;
+}
+```
+
+- **24 bits** covers 2²⁴ seconds ≈ **194 days** before wrapping around
+- Updated on every `Store.get()` (read) and `Store.put()` (write)
+- Saves 40 bits per object compared to a full 64-bit timestamp
+
+#### Idle Time Calculation (with Wraparound)
+
+The idle time tells us how long a key has been untouched. Since the clock wraps around every ~194 days, we handle two cases:
+
+```java
+// LRUClock.java
+public static int getIdleTime(int lastAccessedAt) {
+    int current = getCurrentClock();
+    if (current >= lastAccessedAt) {
+        return current - lastAccessedAt;        // normal case
+    }
+    // Clock wrapped around
+    return (0x00FFFFFF - lastAccessedAt) + current;
+}
+```
+
+**Example** (using a 5-bit clock for simplicity, max = 31):
+- Key `K2` accessed at `t=24`, current time `t=6` (clock wrapped)
+- `idle = (31 - 24) + 6 = 13 seconds`
+
+Without wraparound handling, we'd incorrectly compute `6 - 24 = negative`, which would make a stale key look recently accessed.
+
+#### The Eviction Pool
+
+Rather than scanning all keys on every eviction, we maintain a **fixed-size pool of 16 eviction candidates**, sorted by idle time (highest first = best candidates for eviction):
+
+```java
+// EvictionPool.java
+static final int MAX_POOL_SIZE = 16;
+
+public void push(String key, int lastAccessedAt) {
+    if (keyset.containsKey(key)) return;  // no duplicates
+
+    if (pool.size() < MAX_POOL_SIZE) {
+        // Pool has room — add and re-sort
+        pool.add(item);
+        pool.sort(byIdleTimeDescending);
+    } else if (idleTime(key) > idleTime(worst)) {
+        // Key is a better candidate than the worst in pool — replace it
+        pool.remove(worst);
+        pool.add(item);
+        pool.sort(byIdleTimeDescending);
+    }
+}
+```
+
+**Key properties:**
+- Pool size is fixed at 16 — bounded memory regardless of store size
+- Keys are only added if they're better candidates than existing entries
+- Over multiple eviction passes, the pool accumulates increasingly accurate candidates
+- A `keyset` HashMap prevents duplicate entries
+
+#### The Algorithm — `evictAllkeysLRU()`
+
+```java
+// EvictionManager.java
+static void evictAllkeysLRU() {
+    // Step 1: Sample 5 random keys and push them into the eviction pool
+    populateEvictionPool();
+
+    // Step 2: Pop the best candidates (highest idle time) and delete them
+    int evictCount = (int) (Config.EVICTION_RATIO * Config.KEYS_LIMIT);
+    for (int i = 0; i < evictCount && ePool.size() > 0; i++) {
+        PoolItem item = ePool.pop();
+        Store.del(item.key);
+    }
+}
+```
+
+**Step-by-step:**
+1. **Sample**: Take 5 keys from the store (HashMap iteration = pseudo-random) and push them into the eviction pool
+2. **Pool filters**: Only keys with higher idle time than existing pool entries get in
+3. **Evict**: Pop the top candidates (most idle) from the pool and delete them
+4. **Repeat**: On the next eviction trigger, the pool already has good candidates from previous passes — it accumulates knowledge over time
+
+#### Why This Works
+
+The approximation is surprisingly effective:
+
+| Approach | Memory per key | Accuracy | Throughput impact |
+|----------|---------------|----------|-------------------|
+| True LRU (DLL) | +16 bytes (prev/next pointers) | Perfect | High (constant reshuffling) |
+| **Approx LRU** | +4 bytes (24-bit clock in 32-bit int) | Near-perfect | Negligible |
+
+Redis benchmarks show that with a sample size of 5, the approximated LRU performs very close to a true LRU — evicting nearly the same keys in the same order.
+
+#### Integration with Store
+
+```java
+// Store.java — LRU clock updated on every access
+public static void put(String key, Obj obj) {
+    if (store.size() >= Config.KEYS_LIMIT) {
+        EvictionManager.evict();  // triggers allkeys-lru
+    }
+    obj.lastAccessedAt = LRUClock.getCurrentClock();  // mark as just accessed
+    store.put(key, obj);
+}
+
+public static Obj get(String key) {
+    Obj obj = store.get(key);
+    // ... lazy expiry check ...
+    if (obj != null) {
+        obj.lastAccessedAt = LRUClock.getCurrentClock();  // mark as just accessed
+    }
+    return obj;
+}
+```
+
+Every `GET` and `SET` updates the LRU clock, so frequently accessed keys always have recent timestamps and are protected from eviction.
+
+#### Manual LRU Trigger — The `LRU` Command
+
+For testing and debugging, an `LRU` command is available that manually triggers the approximated LRU eviction:
+
+```
+127.0.0.1:7379> LRU
+OK
+```
+
+This runs `evictAllkeysLRU()` immediately, regardless of whether the store has reached capacity.
+
+#### Files Added/Modified
+
+| File | Change |
+|------|--------|
+| `LRUClock.java` | **New** — 24-bit clock + idle time computation with wraparound |
+| `EvictionPool.java` | **New** — Fixed-size sorted pool of eviction candidates |
+| `Store.java` | Added `lastAccessedAt` field to `Obj`, updated on get/put |
+| `EvictionManager.java` | Added `allkeys-lru` strategy with pool-based eviction |
+| `Config.java` | Default strategy changed from `allkeys-random` to `allkeys-lru` |
+| `Eval.java` | Added `LRU` command for manual eviction trigger |
+
+---
+
+### Command Pipelining
+
+Pipelining is a Redis performance optimization where a client sends **multiple commands at once** without waiting for individual responses. The server processes all commands in order and returns all responses in a **single network write** — dramatically reducing round-trip latency.
+
+#### The Problem Without Pipelining
+
+```
+Client                Server
+  |── PING ──────────>|
+  |                   |  process PING
+  |<── +PONG ─────── |
+  |── SET k v ───────>|  ← wait for response before sending next
+  |                   |  process SET
+  |<── +OK ────────── |
+  |── GET k ─────────>|
+  |                   |  process GET
+  |<── $1\r\nv ─────  |
+```
+
+Each command takes **1 full round-trip time (RTT)**. For 3 commands = 3 RTTs.
+
+#### With Pipelining
+
+```
+Client                Server
+  |── PING ──────────>|
+  |── SET k v ───────>|  ← all sent in one TCP write, no waiting
+  |── GET k ─────────>|
+  |                   |  process PING → buffer "+PONG\r\n"
+  |                   |  process SET  → buffer "+OK\r\n"
+  |                   |  process GET  → buffer "$1\r\nv\r\n"
+  |<── +PONG\r\n ──── |
+  |    +OK\r\n        |  ← all responses in one TCP write
+  |    $1\r\nv\r\n    |
+```
+
+All 3 commands take **1 RTT total**. 3× faster.
+
+#### How Pipelining Works in Our Netty Server
+
+The key insight: pipelining requires **no protocol changes**. The client simply concatenates multiple RESP commands in a single TCP segment. The server's job is to:
+1. Decode all commands from the buffer
+2. Evaluate each command
+3. Send all responses in a single flush
+
+In Netty, this is achieved with the `write()` / `flush()` split:
+
+```java
+// CommandHandler.java
+
+@Override
+protected void channelRead0(ChannelHandlerContext ctx, RedisCmd cmd) {
+    Eval.evalAndRespond(cmd, ctx);  // calls ctx.write() — buffers, does NOT flush
+}
+
+@Override
+public void channelReadComplete(ChannelHandlerContext ctx) {
+    ctx.flush();  // flush ALL buffered responses in one syscall
+}
+```
+
+**The flow when 3 pipelined commands arrive:**
+
+```
+1. TCP data arrives: "*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
+
+2. Netty calls RESPCommandDecoder.decode() in a loop:
+   → decode() extracts PING command, adds to output list
+   → decode() extracts SET k v command, adds to output list  
+   → decode() extracts GET k command, adds to output list
+   → no more complete frames → stop
+
+3. Netty fires channelRead0() for each decoded message:
+   → channelRead0(PING)   → evalPING()   → ctx.write("+PONG\r\n")     [buffered]
+   → channelRead0(SET k v) → evalSET()   → ctx.write("+OK\r\n")       [buffered]
+   → channelRead0(GET k)   → evalGET()   → ctx.write("$1\r\nv\r\n")   [buffered]
+
+4. Netty fires channelReadComplete() ONCE:
+   → ctx.flush()  → all 3 responses sent in 1 write() syscall
+```
+
+#### `ctx.write()` vs `ctx.writeAndFlush()`
+
+| Method | What it does | Syscalls |
+|--------|-------------|----------|
+| `ctx.writeAndFlush(buf)` | Write buffer to channel AND flush to network immediately | 1 syscall per command |
+| `ctx.write(buf)` | Write buffer to Netty's outbound queue (no syscall yet) | 0 |
+| `ctx.flush()` | Flush all queued writes to network | 1 syscall total |
+
+By using `ctx.write()` in `Eval` and `ctx.flush()` in `channelReadComplete()`, we ensure:
+- **Single command** (no pipelining): `channelRead0()` → write, then `channelReadComplete()` → flush. Still 1 syscall — same as before.
+- **3 pipelined commands**: 3× `channelRead0()` → 3 writes buffered, then 1× `channelReadComplete()` → 1 flush. Only 1 syscall instead of 3.
+
+#### Pipelining Example (Testing with `printf` + `nc`)
+
+```bash
+# RESP-encoded: PING + SET k v + GET k — all in one TCP segment
+$ (printf '*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n') | nc localhost 7379
+
+# Response (all at once):
++PONG
++OK
+$1
+v
+```
+
+#### Benchmarking Pipelining
+
+```bash
+# Without pipelining (1 command per round-trip)
+redis-benchmark -n 100000 -t set -c 50 -P 1 -h localhost -p 7379
+
+# With pipelining (16 commands per round-trip)
+redis-benchmark -n 100000 -t set -c 50 -P 16 -h localhost -p 7379
+```
+
+The `-P 16` flag tells `redis-benchmark` to pipeline 16 commands per batch. You should see significantly higher throughput with pipelining enabled.
+
+
+
+### `AOF.java` — Append-Only File Persistence
+
+AOF (Append-Only File) is how Redis persists data to disk. Unlike RDB snapshots (which dump a binary point-in-time snapshot), AOF logs every write command in RESP format so the dataset can be reconstructed by replaying the file.
+
+#### The Problem AOF Solves
+
+Redis (and our jdis server) is an **in-memory** database. If the process crashes or the machine reboots, all data is lost. AOF solves this by writing commands to disk:
+
+```
+In-memory store:                 AOF file on disk:
+  { name: "harsh" }               *3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nharsh\r\n
+  { city: "tokyo" }               *3\r\n$3\r\nSET\r\n$4\r\ncity\r\n$5\r\ntokyo\r\n
+```
+
+On startup, the server reads the AOF file and replays each command to rebuild the store — data is recovered.
+
+#### How `BGREWRITEAOF` Works
+
+The `BGREWRITEAOF` command triggers a **full rewrite** of the AOF file. Instead of appending incremental commands, it dumps the *current state* of every key as a single `SET` command. This is important for **compaction** — if a key was updated 1000 times, the rewritten AOF only contains the final value:
+
+```text
+Before rewrite:           After BGREWRITEAOF:
+  SET counter 1             SET counter 1000
+  SET counter 2
+  SET counter 3
+  ...
+  SET counter 1000
+```
+
+#### The Code
+
+```java
+// AOF.java
+
+public class AOF {
+
+    /**
+     * Writes a single key-value pair as a RESP-encoded SET command to the file.
+     */
+    private static void dumpKey(FileOutputStream fp, String key, Store.Obj obj) throws IOException {
+        String[] tokens = {"SET", key, obj.value.toString()};
+        byte[] encoded = RESPEncoder.encodeStringArray(tokens);
+        fp.write(encoded);
+    }
+
+    /**
+     * Rewrites the entire AOF file from scratch.
+     */
+    public static void dumpAllAOF() {
+        try (FileOutputStream fp = new FileOutputStream(Config.AOF_FILE, false)) {
+            for (Map.Entry<String, Store.Obj> entry : Store.store.entrySet()) {
+                dumpKey(fp, entry.getKey(), entry.getValue());
+            }
+        } catch (IOException e) {
+            logger.severe("error writing AOF file: " + e.getMessage());
+        }
+    }
+}
+```
+
+**Step by step:**
+
+1. **`dumpKey()`** — Takes a single key-value pair and serializes it as a RESP array: `*3\r\n$3\r\nSET\r\n$<keyLen>\r\n<key>\r\n$<valLen>\r\n<value>\r\n`. This is the exact same format a Redis client would send — meaning the AOF file can be replayed using `redis-cli --pipe`.
+
+2. **`dumpAllAOF()`** — Opens (or creates) the AOF file, iterates every key in the store, and calls `dumpKey()` for each. Uses `try-with-resources` so the file is always closed properly, even if an exception occurs.
+
+3. **`Config.AOF_FILE = "./jdis-master.aof"`** — The file path is configurable. By default, it writes to the current directory.
+
+#### The RESP Encoding for AOF
+
+The new `RESPEncoder.encodeStringArray()` method serializes a command (string array) into RESP format:
+
+```java
+// RESPEncoder.java
+
+public static byte[] encodeStringArray(String[] values) {
+    StringBuilder sb = new StringBuilder();
+    sb.append('*').append(values.length).append("\r\n");
+    for (String v : values) {
+        sb.append('$').append(v.length()).append("\r\n");
+        sb.append(v).append("\r\n");
+    }
+    return sb.toString().getBytes();
+}
+```
+
+For `{"SET", "name", "harsh"}`, this produces:
+```
+*3\r\n          ← array of 3 elements
+$3\r\nSET\r\n   ← bulk string "SET" (length 3)
+$4\r\nname\r\n  ← bulk string "name" (length 4)
+$5\r\nharsh\r\n ← bulk string "harsh" (length 5)
+```
+
+#### The `BGREWRITEAOF` Command in Eval
+
+```java
+// Eval.java
+
+private static void evalBGREWRITEAOF(String[] args, ChannelHandlerContext ctx) {
+    AOF.dumpAllAOF();
+    ctx.write(OK_RESPONSE.duplicate());
+}
+```
+
+Simple — calls the AOF dump and responds `+OK`. The command is registered in the dispatch switch:
+
+```java
+case "BGREWRITEAOF":
+    evalBGREWRITEAOF(cmd.getArgs(), ctx);
+    break;
+```
+
+#### Trying BGREWRITEAOF
+
+```bash
+# Start the server
+java -jar bin/jdis.jar
+
+# In another terminal, connect and add some data
+redis-cli -p 7379
+127.0.0.1:7379> SET name harsh
+OK
+127.0.0.1:7379> SET city tokyo
+OK
+127.0.0.1:7379> SET lang java
+OK
+127.0.0.1:7379> BGREWRITEAOF
+OK
+```
+
+Now check the AOF file:
+```bash
+cat jdis-master.aof
+# Output (raw RESP):
+# *3
+# $3
+# SET
+# $4
+# name
+# $5
+# harsh
+# *3
+# $3
+# SET
+# $4
+# city
+# $5
+# tokyo
+# *3
+# $3
+# SET
+# $4
+# lang
+# $4
+# java
+```
+
+Each key is serialized as a complete `SET` command in RESP format — ready to be replayed to restore the dataset.
+
+
+
+#### Current Limitations (TODOs)
+
+1. **No expiration support** — keys with TTL are dumped without their expiry. On replay, all keys would be permanent. Fix: also emit `EXPIRE key <remainingSeconds>` after each SET.
+2. **Only supports string values** — future data structures (lists, sets, hashes) would need their own serialization commands (`RPUSH`, `SADD`, `HSET`).
+3. **Synchronous execution** — the current implementation blocks the event loop while writing. In production Redis, `BGREWRITEAOF` forks a child process. Fix: run `dumpAllAOF()` in a separate thread.
+4. **No incremental AOF** — currently only full rewrites are supported. A complete implementation would also append every write command to the AOF in real-time, and periodically compact with a rewrite.
+
+---
+
+### `ObjTypeEncoding.java` — Redis Object Type and Encoding
+
+In Redis, every stored value isn't just raw bytes — it's wrapped in a **Redis Object** that carries metadata about *what kind of value it is* and *how it's stored in memory*. This enables type-safe operations: `INCR` only works on integer-encoded strings, not on lists or raw strings like `"hello"`.
+
+#### The Redis Object in C
+
+```c
+struct redisObject {
+    unsigned type: 4;       // STRING, LIST, SET, HASH, etc.
+    unsigned encoding: 4;   // INT, RAW, EMBSTR, ZIPLIST, etc.
+    unsigned lru: 24;       // last access time (for eviction)
+    int refcount;           // reference counting for memory management
+    void *ptr;              // pointer to the actual data
+};
+```
+
+The **type** (4 bits) + **encoding** (4 bits) are packed into a single byte. Our Java implementation does the same:
+
+#### Type and Encoding Constants
+
+```java
+// ObjTypeEncoding.java
+
+// Types (upper 4 bits)
+public static final byte OBJ_TYPE_STRING = (byte) (0 << 4);  // 0x00
+
+// Encodings (lower 4 bits)
+public static final byte OBJ_ENCODING_RAW    = 0;  // long string (> 44 bytes)
+public static final byte OBJ_ENCODING_INT    = 1;  // parseable 64-bit integer
+public static final byte OBJ_ENCODING_EMBSTR = 8;  // short string (≤ 44 bytes)
+```
+
+The type and encoding are OR'd together into a single byte:
+- `"42"` → `OBJ_TYPE_STRING | OBJ_ENCODING_INT` = `0x00 | 0x01` = `0x01`
+- `"hello"` → `OBJ_TYPE_STRING | OBJ_ENCODING_EMBSTR` = `0x00 | 0x08` = `0x08`
+- `"a very long string..."` → `OBJ_TYPE_STRING | OBJ_ENCODING_RAW` = `0x00 | 0x00` = `0x00`
+
+#### `deduceTypeEncoding()` — Automatic Encoding Detection
+
+```java
+public static byte[] deduceTypeEncoding(String value) {
+    byte oType = OBJ_TYPE_STRING;
+
+    // Try to parse as integer
+    try {
+        Long.parseLong(value);
+        return new byte[]{oType, OBJ_ENCODING_INT};
+    } catch (NumberFormatException ignored) {}
+
+    // Short string → embedded string encoding
+    if (value.length() <= 44) {
+        return new byte[]{oType, OBJ_ENCODING_EMBSTR};
+    }
+
+    // Long string → raw encoding
+    return new byte[]{oType, OBJ_ENCODING_RAW};
+}
+```
+
+This is called by `evalSET()` every time a value is stored. The encoding is determined **once at write time** and stored with the object — subsequent reads (like `INCR`) check the encoding to decide if the operation is valid.
+
+**Why 44 bytes?** In Redis, strings ≤ 44 bytes use `EMBSTR` encoding where the string data is allocated in the same memory block as the `redisObject` struct itself (one `malloc` instead of two). This saves a pointer dereference and reduces memory fragmentation.
+
+#### Type/Encoding Assertion Utilities
+
+```java
+public static String assertType(byte typeEncoding, byte expectedType) {
+    if (getType(typeEncoding) != expectedType) {
+        return "WRONGTYPE Operation against a key holding the wrong kind of value";
+    }
+    return null;  // OK
+}
+
+public static String assertEncoding(byte typeEncoding, byte expectedEncoding) {
+    if (getEncoding(typeEncoding) != expectedEncoding) {
+        return "ERR value is not an integer or out of range";
+    }
+    return null;  // OK
+}
+```
+
+These return `null` on success or an error message string on failure. Used by `INCR` to validate that the value is a STRING type with INT encoding before attempting arithmetic.
+
+#### Updated `Store.Obj`
+
+```java
+public static class Obj {
+    public Object value;         // mutable so INCR can update it in-place
+    public byte typeEncoding;    // type (upper 4 bits) | encoding (lower 4 bits)
+    public long expiresAt;       // -1 = no expiry
+}
+```
+
+The `value` field is now mutable (not `final`) — `INCR` needs to update the value in-place without creating a new `Obj`.
+
+---
+
+### `INCR` Command — Atomic Integer Increment
+
+The `INCR` command atomically increments the integer value stored at a key by one. If the key doesn't exist, it's created with value `0` before incrementing.
+
+#### Trying INCR
+
+```
+127.0.0.1:7379> SET counter 10
+OK
+127.0.0.1:7379> INCR counter
+(integer) 11
+127.0.0.1:7379> INCR counter
+(integer) 12
+127.0.0.1:7379> GET counter
+"12"
+
+# INCR on a non-existent key → creates it at 0, then increments to 1
+127.0.0.1:7379> INCR newkey
+(integer) 1
+127.0.0.1:7379> GET newkey
+"1"
+
+# INCR on a non-integer string → error
+127.0.0.1:7379> SET name hello
+OK
+127.0.0.1:7379> INCR name
+(error) ERR value is not an integer or out of range
+```
+
+#### The Implementation
+
+```java
+private static void evalINCR(String[] args, ChannelHandlerContext ctx) {
+    if (args.length != 1) {
+        ctx.write(ERR_INCR_ARGS.duplicate());
+        return;
+    }
+
+    String key = args[0];
+    Store.Obj obj = Store.get(key);
+
+    // If key doesn't exist, create it with value "0" and INT encoding
+    if (obj == null) {
+        obj = Store.newObj("0", -1, OBJ_TYPE_STRING, OBJ_ENCODING_INT);
+        Store.put(key, obj);
+    }
+
+    // Assert that the object is a STRING type
+    String typeErr = ObjTypeEncoding.assertType(obj.typeEncoding, OBJ_TYPE_STRING);
+    if (typeErr != null) { writeError(ctx, typeErr); return; }
+
+    // Assert that the encoding is INT
+    String encErr = ObjTypeEncoding.assertEncoding(obj.typeEncoding, OBJ_ENCODING_INT);
+    if (encErr != null) { writeError(ctx, encErr); return; }
+
+    // Parse, increment, store back
+    long i = Long.parseLong(obj.value.toString());
+    i++;
+    obj.value = String.valueOf(i);
+
+    // Return the new value as a RESP integer
+    ByteBuf buf = ctx.alloc().buffer(24);
+    buf.writeByte(':');
+    writeAsciiLong(buf, i);
+    buf.writeByte('\r'); buf.writeByte('\n');
+    ctx.write(buf);
+}
+```
+
+**Step by step:**
+
+1. **Key doesn't exist** → create a new `Obj` with value `"0"`, type `STRING`, encoding `INT`
+2. **Type check** → must be a STRING (not a list, set, etc.)
+3. **Encoding check** → must be INT encoding (the value is a parseable integer)
+4. **Increment** → parse the string as `long`, add 1, store back as string
+5. **Return** → the new value as a RESP integer (`:N\r\n`)
+
+**Why store as String but return as Integer?**
+
+In Redis, string values are always stored as strings internally (even integers like `"42"`). But `INCR` returns the result as a RESP **integer** (`:N\r\n`), not a bulk string (`$2\r\n12\r\n`). This matches Redis's behaviour — `INCR` is a numeric operation that returns a numeric response.
+
+**Why mutate `obj.value` in-place?**
+
+The object is already in the store's HashMap. By mutating `obj.value` directly (which is why `value` is not `final`), we avoid the overhead of creating a new `Obj` and calling `Store.put()` again. Since the server is single-threaded, there are no race conditions.
+
+The logic packs type+encoding in a single byte, checks it before INCR, and mutates the value in-place.
+
+---
+
+### `Store.java` — Changes for DEL and EXPIRE
+
+Two changes were made to `Store.java` to support the new commands.
+
+#### 1. Lazy Expiry Moved into `get()`
+
+```java
+// BEFORE — no expiry check; callers (evalGET, evalTTL) had to check themselves
+public static Obj get(String key) {
+    return store.get(key);
+}
+
+// AFTER — expired keys are deleted on access and null is returned
+public static Obj get(String key) {
+    Obj obj = store.get(key);
+    if (obj != null && obj.expiresAt != -1 && obj.expiresAt <= System.currentTimeMillis()) {
+        store.remove(key);   // ← delete from memory right now
+        return null;
+    }
+    return obj;
+}
+```
+
+Previously, the expiry check was duplicated in both `evalGET` and `evalTTL`. Now it lives in one place — `Store.get()` — and every caller automatically gets lazy expiry for free. Any future command that calls `Store.get()` (e.g., `APPEND`, `INCR`) will also correctly handle expired keys without any extra code.
+
+The `store.remove(key)` inside `get()` is the "lazy" part — the key is deleted from memory the moment it is first accessed after expiry. This reclaims memory even without the background cron, as long as the key is eventually read.
+
+#### 2. `expiresAt` Made Mutable
+
+```java
+// BEFORE
+public final long expiresAt;
+
+// AFTER
+public long expiresAt;  // mutable so EXPIRE can update it
+```
+
+The `EXPIRE` command needs to set a TTL on a key that **already exists** in the store. Rather than creating a new `Obj` (which would require copying the value), we mutate `expiresAt` in-place on the existing object. This is safe because `expiresAt` is the only field that changes — `value` remains `final`.
+
+#### 3. New `del()` Method
+
+```java
+public static boolean del(String key) {
+    return store.remove(key) != null;
+}
+```
+
+A clean, single-responsibility deletion method. Returns `true` if the key existed and was removed, `false` if it wasn't there. The `DEL` command uses this return value to count how many keys were actually deleted.
+
+---
+
+### `Eval.java` — DEL and EXPIRE Handlers
+
+#### `evalDEL()` — DEL key [key ...]
+
+```java
+private static void evalDEL(String[] args, ChannelHandlerContext ctx) {
+    int countDeleted = 0;
+    for (String key : args) {
+        if (Store.del(key)) {
+            countDeleted++;
+        }
+    }
+    // Write ":N\r\n" — RESP integer
+    ByteBuf buf = ctx.alloc().buffer(24);
+    buf.writeByte(':');
+    writeAsciiLong(buf, countDeleted);
+    buf.writeByte('\r'); buf.writeByte('\n');
+    ctx.writeAndFlush(buf);
+}
+```
+
+**Behaviour:**
+- Accepts **one or more keys**: `DEL key1 key2 key3`
+- Iterates all provided keys, calls `Store.del()` on each
+- Returns a **RESP integer** — the count of keys that actually existed and were deleted
+- Keys that didn't exist are silently skipped — not an error
+- Example: `DEL a b ghost` where only `a` and `b` exist → returns `:2\r\n`
+
+**Why a pooled buffer instead of a static one?**
+
+The response is dynamic — the count depends on how many keys existed. We can't pre-compute it. So we use `ctx.alloc().buffer(24)` to get a pooled buffer, write the integer into it, and flush. After the write completes, Netty returns the buffer to the pool — zero GC.
+
+#### `evalEXPIRE()` — EXPIRE key seconds
+
+```java
+private static void evalEXPIRE(String[] args, ChannelHandlerContext ctx) {
+    String key = args[0];
+    long exDurationSec = Long.parseLong(args[1]);
+
+    Store.Obj obj = Store.get(key);
+
+    if (obj == null) {
+        // Key doesn't exist → return 0
+        ctx.writeAndFlush(staticBuf(":0\r\n").duplicate());
+        return;
+    }
+
+    // Mutate the expiry on the live object in-place
+    obj.expiresAt = System.currentTimeMillis() + exDurationSec * 1000;
+
+    // Success → return 1
+    ctx.writeAndFlush(staticBuf(":1\r\n").duplicate());
+}
+```
+
+**Behaviour:**
+- Takes exactly `key` + `seconds`: `EXPIRE mykey 30`
+- Calls `Store.get(key)` — which now includes lazy expiry, so if the key has already expired it returns `null` and we respond with `:0\r\n`
+- If the key exists, **mutates `obj.expiresAt`** in-place to `now + seconds * 1000ms`
+- Returns `:1\r\n` (timeout was set) or `:0\r\n` (key not found)
+- Works on keys that were set without any TTL (e.g., plain `SET foo bar`) — you can add a TTL after the fact
+
+**The `obj.expiresAt = ...` mutation:**
+
+This is why `expiresAt` was changed from `final` to mutable. The `Obj` is retrieved from the store by reference — mutating `obj.expiresAt` directly updates the object that is already stored in the `HashMap`. No need to call `Store.put()` again.
+
+---
+
+### The Full Expiry Picture
+
+```
+Client writes:  SET foo bar EX 10
+                     ↓
+              Store.put("foo", Obj{value="bar", expiresAt=now+10000})
+
+10 seconds later...
+
+Path A — Lazy (client reads the key):
+  GET foo
+    → Store.get("foo")
+    → expiresAt <= now → store.remove("foo") → return null
+    → evalGET sends $-1\r\n (nil)
+
+Path B — Active (background cron, runs every ~1s):
+  ExpiryManager.expireSample()
+    → iterates store, finds "foo" with expiresAt <= now
+    → Store.store.remove("foo")
+    → key is gone from memory
+
+Path C — EXPIRE (client sets TTL on existing key):
+  SET city tokyo          → Obj{value="tokyo", expiresAt=-1}
+  EXPIRE city 30
+    → Store.get("city")   → obj is live
+    → obj.expiresAt = now + 30000
+    → return :1\r\n
+
+Path D — DEL (client explicitly deletes):
+  DEL foo
+    → Store.del("foo")    → store.remove("foo") → true
+    → return :1\r\n
+```
+
+Both lazy and active expiry guarantee the same invariant: **an expired key is never returned to a client**. The difference is only in when the memory is reclaimed:
+- **Lazy**: reclaimed on the next read of that key
+- **Active**: reclaimed within ~1 second by the background cron, even if the key is never read again
+
+---
+
 ### `RedisCmd.java` — The Command Object
 
 ```java
@@ -1036,6 +2253,240 @@ public class RedisCmd {
 - A simple data object that represents a parsed Redis command.
 - `cmd` is always **UPPERCASE** (e.g., `"PING"`, `"GET"`, `"SET"`) — normalized during parsing so the evaluator can use simple string matching.
 - `args` contains everything after the command name. For `PING hello`, `cmd = "PING"` and `args = ["hello"]`.
+
+---
+
+### `KeyspaceStat.java` — Keyspace Statistics Tracking
+
+Redis tracks how many keys are stored in each logical database. This information is exposed via the `INFO keyspace` command and consumed by monitoring tools like Prometheus's `redis_exporter`.
+
+```java
+public class KeyspaceStat {
+
+    private static final int NUM_DBS = 4;
+
+    @SuppressWarnings("unchecked")
+    private static final Map<String, Integer>[] stats = new Map[NUM_DBS];
+
+    public static void incrementStat(int dbNum, String metric) {
+        if (stats[dbNum] == null) stats[dbNum] = new HashMap<>();
+        stats[dbNum].merge(metric, 1, Integer::sum);
+    }
+
+    public static void decrementStat(int dbNum, String metric) {
+        if (stats[dbNum] == null) stats[dbNum] = new HashMap<>();
+        stats[dbNum].merge(metric, -1, Integer::sum);
+    }
+
+    public static Map<String, Integer>[] getAllStats() { return stats; }
+    public static int getNumDbs() { return NUM_DBS; }
+}
+```
+
+**How it works:**
+
+- Maintains an array of 4 `Map<String, Integer>` — one per logical database (one per DB, matching Redis's multi-DB model).
+- Only `db0` is used in our single-database implementation.
+- `incrementStat(0, "keys")` is called by `Store.put()` on every insert.
+- `decrementStat(0, "keys")` is called by `Store.del()` and `EvictionManager` on every removal.
+- Uses `Map.merge()` with `Integer::sum` for atomic increment/decrement — clean and concise.
+
+**Why track stats separately from `store.size()`?**
+
+You could just call `store.size()` in the INFO command. But the stat tracker:
+1. Is extensible — can track `expires`, `avg_ttl`, and other metrics per-DB in the future
+2. Matches Redis's architecture where stats are maintained as side-effect counters
+3. Allows the eviction manager to use `Iterator.remove()` (which bypasses `Store.del()`) while still updating stats directly
+
+---
+
+### `EvictionManager.java` — The `allkeys-random` Strategy
+
+The eviction manager now supports two strategies:
+
+| Strategy | Config Value | Behaviour |
+|----------|-------------|-----------|
+| `simple-first` | `"simple-first"` | Evicts 1 arbitrary key |
+| `allkeys-random` | `"allkeys-random"` | Evicts `EVICTION_RATIO × KEYS_LIMIT` keys (default: 40% of 100 = 40 keys) |
+
+#### The `allkeys-random` Implementation
+
+```java
+private static void evictAllkeysRandom() {
+    long evictCount = (long) (Config.EVICTION_RATIO * Config.KEYS_LIMIT);
+    Iterator<String> it = Store.store.keySet().iterator();
+    while (it.hasNext() && evictCount > 0) {
+        it.next();
+        it.remove();
+        KeyspaceStat.decrementStat(0, "keys");
+        evictCount--;
+    }
+}
+```
+
+**Key design decisions:**
+
+- **Batch eviction** — removes 40 keys at once (configurable via `EVICTION_RATIO`). This prevents the "evict on every write" thrashing that occurs with `simple-first` when the store is near capacity.
+- **Iterator-based removal** — uses `Iterator.remove()` instead of `Store.del()` to safely modify the `HashMap` during iteration. In Java, calling `map.remove(key)` while iterating with a for-each loop throws `ConcurrentModificationException`. The iterator's own `remove()` method is the safe way.
+- **Pseudo-random** — `HashMap` iteration order depends on hash bucket positions. While not truly random, it's arbitrary and non-deterministic from the application's perspective — sufficient for the `allkeys-random` policy.
+- **Stats kept in sync** — calls `KeyspaceStat.decrementStat()` for each evicted key since we bypass `Store.del()`.
+
+**Why not use `Store.del()`?**
+
+`Store.del()` calls `store.remove(key)` internally. If we called `Store.del()` while iterating `store.keySet()`, Java would throw `ConcurrentModificationException`. The iterator-based approach is the only safe way to remove elements during iteration in Java.
+
+#### Updated `Config.java`
+
+```java
+public class Config {
+    public static String HOST = "0.0.0.0";
+    public static int PORT = 7379;
+    public static int KEYS_LIMIT = 100;
+    public static double EVICTION_RATIO = 0.40;          // evict 40% of capacity
+    public static String EVICTION_STRATEGY = "allkeys-random";
+    public static String AOF_FILE = "./jdis-master.aof";
+}
+```
+
+- `KEYS_LIMIT = 100` — raised from 5 to a more realistic value
+- `EVICTION_RATIO = 0.40` — when eviction triggers, free up 40% of capacity (40 keys)
+- `EVICTION_STRATEGY = "allkeys-random"` — the default is now batch random eviction
+
+---
+
+### `INFO`, `CLIENT`, `LATENCY` Commands — Monitoring Compatibility
+
+These three commands enable compatibility with Redis monitoring tools (e.g., `redis_exporter` for Prometheus).
+
+#### `evalINFO()` — INFO [section]
+
+```java
+private static void evalINFO(String[] args, ChannelHandlerContext ctx) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("# Keyspace\r\n");
+
+    Map<String, Integer>[] allStats = KeyspaceStat.getAllStats();
+    for (int i = 0; i < KeyspaceStat.getNumDbs(); i++) {
+        if (allStats[i] != null) {
+            int keys = allStats[i].getOrDefault("keys", 0);
+            sb.append(String.format("db%d:keys=%d,expires=0,avg_ttl=0\r\n", i, keys));
+        }
+    }
+
+    // Return as RESP bulk string
+    byte[] infoBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+    // ... write $<len>\r\n<info>\r\n
+}
+```
+
+**What it returns:**
+
+```
+127.0.0.1:7379> INFO
+# Keyspace
+db0:keys=42,expires=0,avg_ttl=0
+```
+
+- Returns a RESP bulk string containing keyspace statistics.
+- Format matches Redis's `INFO keyspace` output exactly — `db<N>:keys=<count>,expires=<count>,avg_ttl=<ms>`.
+- Only databases with data are listed (empty databases are omitted).
+- `expires` and `avg_ttl` are hardcoded to 0 for now (future enhancement: track actual TTL stats).
+
+**Why this format matters:** Monitoring tools like `redis_exporter` parse this exact format to extract metrics. By matching Redis's output format, our server works with the entire Redis monitoring ecosystem out of the box.
+
+#### `evalCLIENT()` — CLIENT [subcommand]
+
+```java
+private static void evalCLIENT(String[] args, ChannelHandlerContext ctx) {
+    ctx.write(OK_RESPONSE.duplicate());
+}
+```
+
+- Always returns `+OK\r\n` regardless of the subcommand.
+- Exists purely for compatibility — `redis_exporter` sends `CLIENT SETNAME` before querying, and older Redis clients send `CLIENT LIST` during connection setup.
+- Without this stub, the server would return an error and the monitoring tool would disconnect.
+
+#### `evalLATENCY()` — LATENCY [subcommand]
+
+```java
+private static void evalLATENCY(String[] args, ChannelHandlerContext ctx) {
+    ByteBuf buf = ctx.alloc().buffer(8);
+    buf.writeByte('*');  // RESP array
+    buf.writeByte('0');  // empty array
+    buf.writeByte('\r');
+    buf.writeByte('\n');
+    ctx.write(buf);
+}
+```
+
+- Returns an empty RESP array (`*0\r\n`).
+- `redis_exporter` queries `LATENCY LATEST` to check for latency events. An empty array means "no latency events recorded" — a valid response.
+- Without this stub, monitoring tools would log errors on every scrape.
+
+#### Trying the Monitoring Commands
+
+```
+127.0.0.1:7379> SET a 1
+OK
+127.0.0.1:7379> SET b 2
+OK
+127.0.0.1:7379> SET c 3
+OK
+127.0.0.1:7379> INFO
+# Keyspace
+db0:keys=3,expires=0,avg_ttl=0
+
+127.0.0.1:7379> DEL b
+(integer) 1
+127.0.0.1:7379> INFO
+# Keyspace
+db0:keys=2,expires=0,avg_ttl=0
+
+127.0.0.1:7379> CLIENT SETNAME myconn
+OK
+127.0.0.1:7379> LATENCY LATEST
+(empty array)
+```
+
+---
+
+### Monitoring Through Prometheus
+
+With INFO, CLIENT, and LATENCY implemented, you can now monitor the server using the standard Redis monitoring stack:
+
+```
+┌─────────────┐     INFO      ┌──────────────────┐    scrape    ┌────────────┐
+│  jdis       │◄──────────────│  redis_exporter   │◄─────────────│ Prometheus │
+│  (port 7379)│               │  (port 9121)      │              │            │
+└─────────────┘               └──────────────────┘              └────────────┘
+                                                                       │
+                                                                       ▼
+                                                                ┌────────────┐
+                                                                │  Grafana   │
+                                                                └────────────┘
+```
+
+**Setup:**
+
+```bash
+# 1. Start jdis
+java -jar bin/jdis.jar
+
+# 2. Start redis_exporter pointing at jdis
+./redis_exporter -redis.addr redis://localhost:7379
+
+# 3. Start Prometheus (configured to scrape redis_exporter on :9121)
+./prometheus --web.enable-admin-api
+
+# 4. To reset Prometheus data (if needed):
+curl -X POST -g 'http://localhost:9090/api/v1/admin/tsdb/delete_series?match[]={instance="localhost:9121"}'
+```
+
+**What gets exported:**
+
+- `redis_db_keys{db="db0"}` → number of keys in db0 (from `INFO keyspace`)
+- `redis_up` → 1 if the server is reachable, 0 otherwise
+- Various connection and latency metrics (stubbed for now)
 
 ---
 
