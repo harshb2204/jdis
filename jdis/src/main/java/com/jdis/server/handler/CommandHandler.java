@@ -16,7 +16,7 @@ import java.util.logging.Logger;
  * delegates to Eval.evalAndRespond(), and writes the RESP-encoded
  * response back through the pipeline.
  *
- * <h3>Pipelining Support</h3>
+ * Pipelining Support
  *
  * Redis pipelining allows a client to send multiple commands in a single
  * TCP segment without waiting for each response. The server processes all
@@ -24,18 +24,16 @@ import java.util.logging.Logger;
  * number of syscalls and round-trips.
  *
  * In Netty, when multiple commands arrive in one TCP read:
- * <ol>
- *   <li>RESPCommandDecoder.decode() is called in a loop, producing multiple
- *       RedisCmd objects from the buffer</li>
- *   <li>channelRead0() is called once per decoded command — we call
- *       ctx.write() (WITHOUT flush) to buffer the response</li>
- *   <li>channelReadComplete() is called ONCE after all messages from a single
+ * 
+ *   RESPCommandDecoder.decode() is called in a loop, producing multiple
+ *       RedisCmd objects from the buffer
+ *   channelRead0() is called once per decoded command — we call
+ *       ctx.write() (WITHOUT flush) to buffer the response
+ *   channelReadComplete() is called ONCE after all messages from a single
  *       read batch are processed — we call ctx.flush() here to send all
- *       buffered responses in a single write syscall</li>
- * </ol>
+ *       buffered responses in a single write syscall
+ * 
  *
- * This is the Netty equivalent of Go's approach of collecting all responses
- * into a bytes.Buffer and writing them all at once.
  *
  * Marked @Sharable so a single instance can be shared across all
  * connections — safe because it holds no per-connection state.
