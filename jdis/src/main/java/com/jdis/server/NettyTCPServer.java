@@ -15,6 +15,7 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -53,6 +54,15 @@ import java.util.concurrent.TimeUnit;
  *   CommandHandler     : RedisCmd → response written back as ByteBuf
  */
 public class NettyTCPServer {
+
+    /**
+     * Handle to the active-expiry cron task.
+     * To disable the cron at any time, simply call:
+     *     cronFuture.cancel(false);
+     * This is a one-liner that stops future executions without interrupting
+     * a currently-running pass.
+     */
+    public static volatile ScheduledFuture<?> cronFuture;
 
     public static void run() throws InterruptedException {
         boolean useEpoll = Epoll.isAvailable();
@@ -95,7 +105,7 @@ public class NettyTCPServer {
              *   The store HashMap is therefore only ever touched by one thread,
              *   making it safe without ConcurrentHashMap or any synchronization.
              */
-            group.scheduleAtFixedRate(
+            cronFuture = group.scheduleAtFixedRate(
                     ExpiryManager::deleteExpiredKeys,
                     1,          // initial delay — wait 1 s before first run
                     1,          // period — run every 1 s thereafter
