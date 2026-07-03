@@ -57,6 +57,16 @@ public class ExpiryManager {
 
     private static final Logger log = Logger.getLogger(ExpiryManager.class.getName());
 
+    /**
+     * Kill-switch for the active-expiry cron.
+     * Set to {@code false} to make {@link #deleteExpiredKeys()} return immediately
+     * (a no-op), effectively disabling the cron without cancelling the schedule.
+     *
+     * To disable:  {@code ExpiryManager.enabled = false;}
+     * To re-enable: {@code ExpiryManager.enabled = true;}
+     */
+    public static volatile boolean enabled = false;
+
     /** How many keys with an expiry to inspect per sample round. */
     static final int SAMPLE_SIZE = 20;
 
@@ -84,6 +94,8 @@ public class ExpiryManager {
      * the store without any synchronization — identical to how Redis does it.
      */
     public static void deleteExpiredKeys() {
+        if (!enabled) return;   // one-line kill-switch: skip entire pass when disabled
+
         while (true) {
             float expiredFraction = expireSample();
             if (expiredFraction < EXPIRY_THRESHOLD) {
@@ -166,7 +178,7 @@ public class ExpiryManager {
         }
 
         for (String key : toDelete) {
-            Store.store.remove(key);
+            Store.del(key);
         }
 
         if (!toDelete.isEmpty()) {
