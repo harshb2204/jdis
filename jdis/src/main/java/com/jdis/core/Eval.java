@@ -5,6 +5,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 /**
  * Evaluates Redis commands and writes RESP responses back to the client.
@@ -130,8 +131,11 @@ public class Eval {
             }
         }
 
-        // Store the key-value pair
-        Store.put(key, Store.newObj(value, exDurationMs));
+        // Deduce type and encoding from the value
+        byte[] te = ObjTypeEncoding.deduceTypeEncoding(value);
+
+        // Store the key-value pair with type/encoding metadata
+        Store.put(key, Store.newObj(value, exDurationMs, te[0], te[1]));
         ctx.write(OK_RESPONSE.duplicate());
     }
 
@@ -307,6 +311,77 @@ public class Eval {
     }
 
     // -------------------------------------------------------------------------
+    // INCR key
+    // -------------------------------------------------------------------------
+
+    /**
+     * INCR key
+     *
+     * Increments the integer value stored at key by one. If the key does not
+     * exist, it is initialized to 0 before performing the increment.
+     *
+     * Returns an error if the value is not an integer or out of range.
+     *
+     * Returns:
+     *   The new value of the key after the increment (as a RESP integer).
+     */
+    private static final ByteBuf ERR_INCR_ARGS = staticBuf(
+            "-ERR wrong number of arguments for 'incr' command\r\n");
+
+    private static void evalINCR(String[] args, ChannelHandlerContext ctx) {
+        if (args.length != 1) {
+            ctx.write(ERR_INCR_ARGS.duplicate());
+            return;
+        }
+
+        String key = args[0];
+        Store.Obj obj = Store.get(key);
+
+        // If key doesn't exist, create it with value "0" and INT encoding
+        if (obj == null) {
+            obj = Store.newObj("0", -1,
+                    ObjTypeEncoding.OBJ_TYPE_STRING,
+                    ObjTypeEncoding.OBJ_ENCODING_INT);
+            Store.put(key, obj);
+        }
+
+        // Assert that the object is a STRING type
+        String typeErr = ObjTypeEncoding.assertType(obj.typeEncoding, ObjTypeEncoding.OBJ_TYPE_STRING);
+        if (typeErr != null) {
+            writeError(ctx, typeErr);
+            return;
+        }
+
+        // Assert that the encoding is INT (value must be a parseable integer)
+        String encErr = ObjTypeEncoding.assertEncoding(obj.typeEncoding, ObjTypeEncoding.OBJ_ENCODING_INT);
+        if (encErr != null) {
+            writeError(ctx, encErr);
+            return;
+        }
+
+        // Parse the current value, increment, and store back
+        long i = Long.parseLong(obj.value.toString());
+        i++;
+        obj.value = String.valueOf(i);
+
+        // Return the new value as a RESP integer
+        ByteBuf buf = ctx.alloc().buffer(24);
+        buf.writeByte(':');
+        writeAsciiLong(buf, i);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        ctx.write(buf);
+    }
+
+    /** Writes a RESP error string to the context. */
+    private static void writeError(ChannelHandlerContext ctx, String message) {
+        byte[] msgBytes = ("-" + message + "\r\n").getBytes(StandardCharsets.UTF_8);
+        ByteBuf buf = ctx.alloc().buffer(msgBytes.length);
+        buf.writeBytes(msgBytes);
+        ctx.write(buf);
+    }
+
+    // -------------------------------------------------------------------------
     // BGREWRITEAOF
     // -------------------------------------------------------------------------
 
@@ -320,6 +395,99 @@ public class Eval {
      */
     private static void evalBGREWRITEAOF(String[] args, ChannelHandlerContext ctx) {
         AOF.dumpAllAOF();
+        ctx.write(OK_RESPONSE.duplicate());
+    }
+
+    // -------------------------------------------------------------------------
+    // INFO [section]
+    // -------------------------------------------------------------------------
+
+    /**
+     * INFO [section]
+     *
+     * Returns information and statistics about the server.
+     * Currently supports keyspace information showing the number of keys
+     * per logical database.
+     *
+     * Returns a RESP bulk string with the info formatted as:
+     *   # Keyspace\r\n
+     *   db0:keys=<count>,expires=0,avg_ttl=0\r\n
+     */
+    private static void evalINFO(String[] args, ChannelHandlerContext ctx) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Keyspace\r\n");
+
+        Map<String, Integer>[] allStats = KeyspaceStat.getAllStats();
+        for (int i = 0; i < KeyspaceStat.getNumDbs(); i++) {
+            if (allStats[i] != null) {
+                int keys = allStats[i].getOrDefault("keys", 0);
+                sb.append(String.format("db%d:keys=%d,expires=0,avg_ttl=0\r\n", i, keys));
+            }
+        }
+
+        // Return as RESP bulk string
+        String info = sb.toString();
+        byte[] infoBytes = info.getBytes(StandardCharsets.UTF_8);
+        ByteBuf buf = ctx.alloc().buffer(infoBytes.length + 16);
+        buf.writeByte('$');
+        writeAsciiLong(buf, infoBytes.length);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        buf.writeBytes(infoBytes);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        ctx.write(buf);
+    }
+
+    // -------------------------------------------------------------------------
+    // CLIENT
+    // -------------------------------------------------------------------------
+
+    /**
+     * CLIENT [subcommand]
+     *
+     * Stub implementation that always returns +OK.
+     * Used for compatibility with Redis monitoring tools.
+     */
+    private static void evalCLIENT(String[] args, ChannelHandlerContext ctx) {
+        ctx.write(OK_RESPONSE.duplicate());
+    }
+
+    // -------------------------------------------------------------------------
+    // LATENCY
+    // -------------------------------------------------------------------------
+
+    /**
+     * LATENCY [subcommand]
+     *
+     * Stub implementation that returns an empty RESP array.
+     * Used for compatibility with Redis monitoring tools.
+     */
+    private static void evalLATENCY(String[] args, ChannelHandlerContext ctx) {
+        // Empty RESP array: *0\r\n
+        ByteBuf buf = ctx.alloc().buffer(8);
+        buf.writeByte('*');
+        buf.writeByte('0');
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        ctx.write(buf);
+    }
+
+    // -------------------------------------------------------------------------
+    // LRU (manual trigger for approximated LRU eviction)
+    // -------------------------------------------------------------------------
+
+    /**
+     * LRU
+     *
+     * Manually triggers the approximated LRU eviction algorithm.
+     * This is useful for testing and debugging the eviction behavior
+     * without waiting for the store to reach capacity.
+     *
+     * Returns +OK after eviction completes.
+     */
+    private static void evalLRU(String[] args, ChannelHandlerContext ctx) {
+        EvictionManager.evictAllkeysLRU();
         ctx.write(OK_RESPONSE.duplicate());
     }
 
@@ -353,8 +521,23 @@ public class Eval {
             case "EXPIRE":
                 evalEXPIRE(cmd.getArgs(), ctx);
                 break;
+            case "INCR":
+                evalINCR(cmd.getArgs(), ctx);
+                break;
             case "BGREWRITEAOF":
                 evalBGREWRITEAOF(cmd.getArgs(), ctx);
+                break;
+            case "INFO":
+                evalINFO(cmd.getArgs(), ctx);
+                break;
+            case "CLIENT":
+                evalCLIENT(cmd.getArgs(), ctx);
+                break;
+            case "LATENCY":
+                evalLATENCY(cmd.getArgs(), ctx);
+                break;
+            case "LRU":
+                evalLRU(cmd.getArgs(), ctx);
                 break;
             default:
                 evalPING(cmd.getArgs(), ctx);
